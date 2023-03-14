@@ -33,7 +33,7 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./Signature.sol";
 
-struct ValsetArgs {
+struct ValidatorSet {
   uint256 epoch;
   address[] validators;
   uint256[] powers;
@@ -48,14 +48,14 @@ struct DepositEvent {
 struct WithdrawEvent {
   address user;
   uint256 usdc;
-  ValsetArgs valsetArgs;
+  ValidatorSet validatorSet;
   uint256 timestamp;
 }
 
-contract Bridge is Ownable, Pausable, ReentrancyGuard {
+contract Bridge2 is Ownable, Pausable, ReentrancyGuard {
   ERC20 usdcToken;
 
-  bytes32 public valsetCheckpoint;
+  bytes32 public validatorSetCheckpoint;
   uint256 public epoch;
   uint256 public powerThreshold;
   uint256 public totalValidatorPower;
@@ -65,7 +65,7 @@ contract Bridge is Ownable, Pausable, ReentrancyGuard {
   event Deposit(DepositEvent e);
   event Withdraw(WithdrawEvent e);
 
-  event ValsetUpdatedEvent(uint256 indexed epoch, address[] validators, uint256[] powers);
+  event ValidatorSetUpdatedEvent(uint256 indexed epoch, address[] validators, uint256[] powers);
 
   constructor(
     uint256 _totalValidatorPower,
@@ -84,18 +84,18 @@ contract Bridge is Ownable, Pausable, ReentrancyGuard {
     );
     checkNewValidatorPowers(powers);
 
-    ValsetArgs memory valset;
-    valset = ValsetArgs(0, validators, powers);
-    bytes32 newCheckpoint = makeCheckpoint(valset);
-    valsetCheckpoint = newCheckpoint;
+    ValidatorSet memory validatorSet;
+    validatorSet = ValidatorSet(0, validators, powers);
+    bytes32 newCheckpoint = makeCheckpoint(validatorSet);
+    validatorSetCheckpoint = newCheckpoint;
     usdcToken = ERC20(usdcAddress);
 
-    emit ValsetUpdatedEvent(0, validators, powers);
+    emit ValidatorSetUpdatedEvent(0, validators, powers);
   }
 
-  function makeCheckpoint(ValsetArgs memory valsetArgs) private pure returns (bytes32) {
+  function makeCheckpoint(ValidatorSet memory validatorSet) private pure returns (bytes32) {
     bytes32 checkpoint = keccak256(
-      abi.encode(valsetArgs.validators, valsetArgs.powers, valsetArgs.epoch)
+      abi.encode(validatorSet.validators, validatorSet.powers, validatorSet.epoch)
     );
     return checkpoint;
   }
@@ -109,11 +109,11 @@ contract Bridge is Ownable, Pausable, ReentrancyGuard {
   function withdraw(
     uint256 usdc,
     uint256 nonce,
-    ValsetArgs memory valsetArgs,
+    ValidatorSet memory validatorSet,
     Signature[] memory signatures
   ) external nonReentrant whenNotPaused {
     require(
-      makeCheckpoint(valsetArgs) == valsetCheckpoint,
+      makeCheckpoint(validatorSet) == validatorSetCheckpoint,
       "Supplied current validators and powers do not match the current checkpoint."
     );
 
@@ -125,14 +125,14 @@ contract Bridge is Ownable, Pausable, ReentrancyGuard {
     require(!processedWithdrawals[message], "Already withdrawn.");
     processedWithdrawals[message] = true;
 
-    checkValidatorSignatures(message, valsetArgs, signatures);
+    checkValidatorSignatures(message, validatorSet, signatures);
     usdcToken.transfer(msg.sender, usdc);
 
     emit Withdraw(
       WithdrawEvent({
         user: msg.sender,
         usdc: usdc,
-        valsetArgs: valsetArgs,
+        validatorSet: validatorSet,
         timestamp: blockMillis()
       })
     );
@@ -140,16 +140,16 @@ contract Bridge is Ownable, Pausable, ReentrancyGuard {
 
   function checkValidatorSignatures(
     bytes32 message,
-    ValsetArgs memory valsetArgs,
+    ValidatorSet memory validatorSet,
     Signature[] memory signatures
   ) private view {
     uint256 cumulativePower = 0;
-    for (uint256 i = 0; i < valsetArgs.validators.length; i++) {
+    for (uint256 i = 0; i < validatorSet.validators.length; i++) {
       require(
-        recoverSigner(message, signatures[i]) == valsetArgs.validators[i],
+        recoverSigner(message, signatures[i]) == validatorSet.validators[i],
         "Validator signature does not match."
       );
-      cumulativePower = cumulativePower + valsetArgs.powers[i];
+      cumulativePower = cumulativePower + validatorSet.powers[i];
       if (cumulativePower > powerThreshold) {
         break;
       }
@@ -160,44 +160,49 @@ contract Bridge is Ownable, Pausable, ReentrancyGuard {
     );
   }
 
-  function updateValset(
-    ValsetArgs calldata newValset,
-    ValsetArgs calldata currentValset,
+  function updateValidatorSet(
+    ValidatorSet calldata newValidatorSet,
+    ValidatorSet calldata curValidatorSet,
     Signature[] calldata signatures
   ) external whenNotPaused {
     {
       require(
-        currentValset.epoch == epoch,
-        "Current valset epoch supplied doesn't match the current epoch"
+        curValidatorSet.epoch == epoch,
+        "Current validatorSet epoch supplied doesn't match the current epoch"
       );
       require(
-        newValset.epoch > currentValset.epoch,
-        "New valset epoch must be greater than the current epoch"
+        newValidatorSet.epoch > curValidatorSet.epoch,
+        "New validatorSet epoch must be greater than the current epoch"
       );
 
       require(
-        newValset.validators.length == newValset.powers.length,
+        newValidatorSet.validators.length == newValidatorSet.powers.length,
         "Malformed new validator set"
       );
 
       require(
-        currentValset.validators.length == signatures.length,
+        curValidatorSet.validators.length == signatures.length,
         "Malformed current validator set"
       );
 
       require(
-        makeCheckpoint(currentValset) == valsetCheckpoint,
+        makeCheckpoint(curValidatorSet) == validatorSetCheckpoint,
         "Supplied current validators and powers do not match checkpoint."
       );
     }
 
-    checkNewValidatorPowers(newValset.powers);
-    bytes32 newCheckpoint = makeCheckpoint(newValset);
-    checkValidatorSignatures(newCheckpoint, currentValset, signatures);
-    valsetCheckpoint = newCheckpoint;
-    epoch = newValset.epoch;
+    checkNewValidatorPowers(newValidatorSet.powers);
+    bytes32 newCheckpoint = makeCheckpoint(newValidatorSet);
+    Agent memory agent = Agent("a", newCheckpoint);
+    bytes32 message = hash(agent);
+    checkValidatorSignatures(message, curValidatorSet, signatures);
+    validatorSetCheckpoint = newCheckpoint;
 
-    emit ValsetUpdatedEvent(newValset.epoch, newValset.validators, newValset.powers);
+    emit ValidatorSetUpdatedEvent(
+      newValidatorSet.epoch,
+      newValidatorSet.validators,
+      newValidatorSet.powers
+    );
   }
 
   function checkNewValidatorPowers(uint256[] memory powers) private view {
