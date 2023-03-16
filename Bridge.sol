@@ -136,9 +136,9 @@ contract Bridge2 is Ownable, Pausable, ReentrancyGuard {
     bytes32 message = hash(agent);
 
     require(!processedWithdrawals[message], "Already withdrawn");
-    processedWithdrawals[message] = true;
-
     checkValidatorSignatures(message, curValidatorSet, signers, signatures);
+
+    processedWithdrawals[message] = true;
     usdcToken.transfer(msg.sender, usdc);
 
     emit Withdraw(
