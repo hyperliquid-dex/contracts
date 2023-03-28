@@ -64,17 +64,19 @@ struct WithdrawEvent {
   uint256 timestamp;
 }
 
-contract Bridge2 is Ownable, Pausable, ReentrancyGuard {
+contract Bridge is Ownable, Pausable, ReentrancyGuard {
   ERC20 usdcToken;
 
   bytes32 public validatorSetCheckpoint;
   uint256 public epoch;
   uint256 public powerThreshold;
-  uint256 public minTotalValidatorPower;
+  uint256 public immutable minTotalValidatorPower;
   // Expose this for convenience because we only store the hash.
   uint256 public nValidators;
 
   mapping(bytes32 => bool) processedWithdrawals;
+
+  bytes32 immutable domainSeparator;
 
   // These events wrap structs because of a quirk of rust client code which parses them.
   event Deposit(DepositEvent e);
@@ -90,10 +92,11 @@ contract Bridge2 is Ownable, Pausable, ReentrancyGuard {
     uint256[] memory powers,
     address usdcAddress
   ) {
+    domainSeparator = makeDomainSeparator();
     minTotalValidatorPower = _minTotalValidatorPower;
-    powerThreshold = (2 * _minTotalValidatorPower) / 3;
+    uint256 cumulativePower = checkNewValidatorPowers(powers);
+    powerThreshold = (2 * cumulativePower) / 3;
 
-    checkNewValidatorPowers(powers);
     nValidators = validators.length;
 
     ValidatorSet memory validatorSet;
@@ -105,6 +108,8 @@ contract Bridge2 is Ownable, Pausable, ReentrancyGuard {
     emit ValidatorSetUpdatedEvent(0, validators, powers);
   }
 
+  // A utility function to make a checkpoint of the validator set supplied.
+  // The checkpoint is the hash of all the validators, the powers and the epoch.
   function makeCheckpoint(ValidatorSet memory validatorSet) private pure returns (bytes32) {
     require(
       validatorSet.validators.length == validatorSet.powers.length,
@@ -117,12 +122,16 @@ contract Bridge2 is Ownable, Pausable, ReentrancyGuard {
     return checkpoint;
   }
 
+  // An external function anyone can call to deposit usdc into the brigde.
+  // A deposit event will be emitted crediting the L1 with the usdc.
   function deposit(uint256 usdc) external whenNotPaused nonReentrant {
     address user = msg.sender;
-    usdcToken.transferFrom(user, address(this), usdc);
     emit Deposit(DepositEvent({ user: user, usdc: usdc, timestamp: blockMillis() }));
+    usdcToken.transferFrom(user, address(this), usdc);
   }
 
+  // An external function anyone can call to withdraw usdc from the bridge by providing valid signatures
+  // from the current L1 validators.
   function withdraw(
     uint256 usdc,
     uint256 nonce,
@@ -139,8 +148,6 @@ contract Bridge2 is Ownable, Pausable, ReentrancyGuard {
     checkValidatorSignatures(message, curValidatorSet, signers, signatures);
 
     processedWithdrawals[message] = true;
-    usdcToken.transfer(msg.sender, usdc);
-
     emit Withdraw(
       WithdrawEvent({
         user: msg.sender,
@@ -149,8 +156,10 @@ contract Bridge2 is Ownable, Pausable, ReentrancyGuard {
         timestamp: blockMillis()
       })
     );
+    usdcToken.transfer(msg.sender, usdc);
   }
 
+  // Utility function that verifies the signatures supplied and checks that the validators have reached quorum.
   function checkValidatorSignatures(
     bytes32 message,
     ValidatorSet memory curValidatorSet, // Current set of all L1 validators
@@ -166,16 +175,16 @@ contract Bridge2 is Ownable, Pausable, ReentrancyGuard {
     require(nSigners > 0, "Signers empty");
     require(nSigners == signatures.length, "Signatures and signers have different lengths");
 
-    uint256 cumulativePower = 0;
-    uint256 signerIdx = 0;
+    uint256 cumulativePower;
+    uint256 signerIdx;
     uint256 end = curValidatorSet.validators.length;
 
-    for (uint256 curValidatorSetIdx = 0; curValidatorSetIdx < end; curValidatorSetIdx++) {
+    for (uint256 curValidatorSetIdx; curValidatorSetIdx < end; curValidatorSetIdx++) {
       address signer = signers[signerIdx];
       if (signer == curValidatorSet.validators[curValidatorSetIdx]) {
         uint256 power = curValidatorSet.powers[curValidatorSetIdx];
         require(
-          recoverSigner(message, signatures[signerIdx]) == signer,
+          recoverSigner(message, signatures[signerIdx], domainSeparator) == signer,
           "Validator signature does not match"
         );
         cumulativePower += power;
@@ -197,23 +206,23 @@ contract Bridge2 is Ownable, Pausable, ReentrancyGuard {
     );
   }
 
+  // This function updates the validator set by checking that the current validators have signed
+  // off on the new validator set
   function updateValidatorSet(
     ValidatorSet memory newValidatorSet,
     ValidatorSet memory curValidatorSet,
     address[] memory signers,
     Signature[] memory signatures
   ) external whenNotPaused {
-    {
-      require(
-        makeCheckpoint(curValidatorSet) == validatorSetCheckpoint,
-        "Supplied current validators and powers do not match checkpoint"
-      );
+    require(
+      makeCheckpoint(curValidatorSet) == validatorSetCheckpoint,
+      "Supplied current validators and powers do not match checkpoint"
+    );
 
-      require(
-        newValidatorSet.epoch > curValidatorSet.epoch,
-        "New validator set epoch must be greater than the current epoch"
-      );
-    }
+    require(
+      newValidatorSet.epoch > curValidatorSet.epoch,
+      "New validator set epoch must be greater than the current epoch"
+    );
 
     uint256 cumulativePower = checkNewValidatorPowers(newValidatorSet.powers);
     bytes32 newCheckpoint = makeCheckpoint(newValidatorSet);
@@ -232,10 +241,11 @@ contract Bridge2 is Ownable, Pausable, ReentrancyGuard {
     );
   }
 
+  // This function checks that the total power of the new validator set is greater than minTotalValidatorPower.
   function checkNewValidatorPowers(uint256[] memory powers) private view returns (uint256) {
-    uint256 cumulativePower = 0;
-    for (uint256 i = 0; i < powers.length; i++) {
-      cumulativePower = cumulativePower + powers[i];
+    uint256 cumulativePower;
+    for (uint256 i; i < powers.length; i++) {
+      cumulativePower += powers[i];
     }
 
     require(
@@ -245,6 +255,7 @@ contract Bridge2 is Ownable, Pausable, ReentrancyGuard {
     return cumulativePower;
   }
 
+  // Utility function that returns the block timestamp in milliseconds
   function blockMillis() private view returns (uint256) {
     return 1000 * block.timestamp;
   }
