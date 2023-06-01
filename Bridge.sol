@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: UNLICENSED
+// NOSHIP update docs here
 
 /*
     This bridge contract runs on Arbitrum, operating alongside the Hyperliquid L1.
@@ -6,16 +7,23 @@
     The L1 runs tendermint consensus, with validator set updates happening at the end of each epoch.
     Epoch duration TBD, but likely somewhere between 1 day and 1 week
 
+    Lockers:
+      These addresses are approved by the validators to lock the contract if submitted signatures do not match
+      the locker's view of the L1. Once locked, only a quorum of cold wallet validator signatures can unlock the bridge.
+      This dispute period is used for both withdrawals and validator set updates.
+
     Validator set updates:
       The current validators sign a hash of the new validator set and powers on the L1.
       This contract checks those signatures, and updates the hash of the current validator set.
-      The current validators' stake is still locked for at least one more epoch (unbonding period),
+      The current validators' L1 stake is still locked for at least one more epoch (unbonding period),
       and the new validators will slash the old ones' stake if they do not properly generate the
       validator set update signatures.
+      The validator set change is pending for a period of time for the lockers to dispute the change.
 
     Withdrawals:
-      The validators sign withdrawals on the L1, which the user sends to this contract in withdraw().
-      This contract checks the signatures, and then sends the USDC to the user.
+      The validators sign withdrawals on the L1, which the user sends to this contract in claimWithdrawal().
+      This contract checks the signatures, and then creates a pending withdrawal which can be disputed for a period of time.
+      After the dispute period has elapsed, a second transaction can be sent to finalize the withdrawal and release the USDC.
 
     Deposits:
       The validators on the L1 listen for and sign DepositEvent events emitted by this contract,
@@ -46,71 +54,146 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "./Signature.sol";
 
 struct ValidatorSet {
-  uint256 epoch;
+  uint64 epoch;
   address[] validators;
-  uint256[] powers;
+  uint64[] powers;
+}
+
+struct ValidatorSetUpdateRequest {
+  uint64 epoch;
+  address[] hotAddresses;
+  address[] coldAddresses;
+  uint64[] powers;
+}
+
+struct PendingValidatorSetUpdate {
+  uint64 epoch;
+  uint64 powerThreshold;
+  uint256 updateTime;
+  bytes32 hotValidatorSetHash;
+  bytes32 coldValidatorSetHash;
 }
 
 struct DepositEvent {
   address user;
-  uint256 usdc;
-  uint256 timestamp;
+  uint64 usdc;
 }
 
-struct WithdrawEvent {
+struct Withdrawal {
   address user;
-  uint256 usdc;
-  ValidatorSet validatorSet;
-  uint256 timestamp;
+  uint64 usdc;
+  uint64 nonce;
+  uint64 claimedTime;
+  bytes32 message;
 }
 
-contract Bridge is Ownable, Pausable, ReentrancyGuard {
+struct ClaimedWithdrawalEvent {
+  address user;
+  uint64 usdc;
+  uint64 nonce;
+  bytes32 message;
+  uint64 claimedTime;
+}
+
+struct FinalizedWithdrawalEvent {
+  address user;
+  uint64 usdc;
+  uint64 nonce;
+  bytes32 message;
+}
+
+// NOSHIP remove ownable and replace with checking validator signatures and time
+contract Bridge2 is Ownable, Pausable, ReentrancyGuard {
   ERC20 usdcToken;
 
-  bytes32 public validatorSetCheckpoint;
-  uint256 public epoch;
-  uint256 public powerThreshold;
-  uint256 public immutable minTotalValidatorPower;
-  // Expose this for convenience because we only store the hash.
-  uint256 public nValidators;
+  bytes32 public hotValidatorSetHash;
+  bytes32 public coldValidatorSetHash;
+  PendingValidatorSetUpdate public pendingValidatorSetUpdate;
+  mapping(bytes32 => bool) usedLockerUpdateMessages;
+  mapping(address => bool) lockers;
 
-  mapping(bytes32 => bool) processedWithdrawals;
+  mapping(bytes32 => bool) usedUnlockMessages;
+
+  uint64 public epoch;
+  uint64 public powerThreshold;
+  uint64 public disputePeriodSeconds;
+  uint64 public immutable minTotalValidatorPower;
+  // Expose this for convenience because we only store the hash.
+  uint64 public nValidators;
+
+  mapping(bytes32 => Withdrawal) claimedWithdrawals;
+  mapping(bytes32 => bool) finalizedWithdrawals;
 
   bytes32 immutable domainSeparator;
 
   // These events wrap structs because of a quirk of rust client code which parses them.
   event Deposit(DepositEvent e);
-  event Withdraw(WithdrawEvent e);
+  event ClaimedWithdrawal(ClaimedWithdrawalEvent e);
+  event FinalizedWithdrawal(FinalizedWithdrawalEvent e);
 
-  event ValidatorSetUpdatedEvent(uint256 indexed epoch, address[] validators, uint256[] powers);
+  event ValidatorSetUpdateRequested(
+    uint64 indexed epoch,
+    address[] hotValidatorAddresses,
+    address[] coldValidatorAddresses,
+    uint64[] powers
+  );
+
+  event ValidatorSetUpdateFinalized(
+    uint64 indexed epoch,
+    bytes32 hotValidatorSetHash,
+    bytes32 coldValidatorSetHash
+  );
+
+  event ModifiedLocker(address indexed locker, bool isLocker);
 
   // TODO if it saves gas, have the deployer initialize separately so that all function args can be calldata.
   // However, calldata does not seem to save gas on Arbitrum, so not a big deal for now.
   constructor(
-    uint256 _minTotalValidatorPower,
-    address[] memory validators,
-    uint256[] memory powers,
-    address usdcAddress
+    uint64 _minTotalValidatorPower,
+    address[] memory hotValidatorAddresses,
+    address[] memory coldValidatorAddresses,
+    uint64[] memory powers,
+    address usdcAddress,
+    uint64 _disputePeriodSeconds
   ) {
     domainSeparator = makeDomainSeparator();
     minTotalValidatorPower = _minTotalValidatorPower;
-    uint256 cumulativePower = checkNewValidatorPowers(powers);
+    uint64 cumulativePower = checkNewValidatorPowers(powers);
     powerThreshold = (2 * cumulativePower) / 3;
 
-    nValidators = validators.length;
+    require(
+      hotValidatorAddresses.length == coldValidatorAddresses.length,
+      "Hot and cold validator sets length mismatch"
+    );
+    nValidators = uint64(hotValidatorAddresses.length);
 
-    ValidatorSet memory validatorSet;
-    validatorSet = ValidatorSet(0, validators, powers);
-    bytes32 newCheckpoint = makeCheckpoint(validatorSet);
-    validatorSetCheckpoint = newCheckpoint;
+    ValidatorSet memory hotValidatorSet;
+    hotValidatorSet = ValidatorSet({ epoch: 0, validators: hotValidatorAddresses, powers: powers });
+    bytes32 newHotValidatorSetHash = makeValidatorSetHash(hotValidatorSet);
+    hotValidatorSetHash = newHotValidatorSetHash;
+
+    ValidatorSet memory coldValidatorSet;
+    coldValidatorSet = ValidatorSet({
+      epoch: 0,
+      validators: coldValidatorAddresses,
+      powers: powers
+    });
+    bytes32 newColdValidatorSetHash = makeValidatorSetHash(coldValidatorSet);
+    coldValidatorSetHash = newColdValidatorSetHash;
+
     usdcToken = ERC20(usdcAddress);
+    // NOSHIP what should this be?
+    // Also let validators set this
+    disputePeriodSeconds = _disputePeriodSeconds;
 
-    emit ValidatorSetUpdatedEvent(0, validators, powers);
+    emit ValidatorSetUpdateRequested(0, hotValidatorAddresses, coldValidatorAddresses, powers);
+
+    emit ValidatorSetUpdateFinalized(0, newHotValidatorSetHash, newColdValidatorSetHash);
   }
 
   // A utility function to make a checkpoint of the validator set supplied.
   // The checkpoint is the hash of all the validators, the powers and the epoch.
-  function makeCheckpoint(ValidatorSet memory validatorSet) private pure returns (bytes32) {
+  function makeValidatorSetHash(ValidatorSet memory validatorSet) private pure returns (bytes32) {
     require(
       validatorSet.validators.length == validatorSet.powers.length,
       "Malformed validator set"
@@ -124,18 +207,18 @@ contract Bridge is Ownable, Pausable, ReentrancyGuard {
 
   // An external function anyone can call to deposit usdc into the brigde.
   // A deposit event will be emitted crediting the L1 with the usdc.
-  function deposit(uint256 usdc) external whenNotPaused nonReentrant {
+  function deposit(uint64 usdc) external whenNotPaused nonReentrant {
     address user = msg.sender;
-    emit Deposit(DepositEvent({ user: user, usdc: usdc, timestamp: blockMillis() }));
+    emit Deposit(DepositEvent({ user: user, usdc: usdc }));
     usdcToken.transferFrom(user, address(this), usdc);
   }
 
   // An external function anyone can call to withdraw usdc from the bridge by providing valid signatures
   // from the current L1 validators.
-  function withdraw(
-    uint256 usdc,
-    uint256 nonce,
-    ValidatorSet calldata curValidatorSet,
+  function claimWithdrawal(
+    uint64 usdc,
+    uint64 nonce,
+    ValidatorSet calldata hotValidatorSet,
     address[] calldata signers,
     Signature[] calldata signatures
   ) external nonReentrant whenNotPaused {
@@ -143,20 +226,47 @@ contract Bridge is Ownable, Pausable, ReentrancyGuard {
     // For now we do not care about the overhead with EIP-712 because Arbitrum gas is basically free.
     Agent memory agent = Agent("a", keccak256(abi.encode(msg.sender, usdc, nonce)));
     bytes32 message = hash(agent);
+    Withdrawal memory withdrawal = Withdrawal({
+      user: msg.sender,
+      usdc: usdc,
+      nonce: nonce,
+      claimedTime: uint64(block.timestamp),
+      message: message
+    });
 
-    require(!processedWithdrawals[message], "Already withdrawn");
-    checkValidatorSignatures(message, curValidatorSet, signers, signatures);
+    require(claimedWithdrawals[message].claimedTime == 0, "Withdrawal already claimed");
+    checkValidatorSignatures(message, hotValidatorSet, signers, signatures, hotValidatorSetHash);
 
-    processedWithdrawals[message] = true;
-    emit Withdraw(
-      WithdrawEvent({
-        user: msg.sender,
-        usdc: usdc,
-        validatorSet: curValidatorSet,
-        timestamp: blockMillis()
+    claimedWithdrawals[message] = withdrawal;
+    emit ClaimedWithdrawal(
+      ClaimedWithdrawalEvent({
+        user: withdrawal.user,
+        usdc: withdrawal.usdc,
+        nonce: withdrawal.nonce,
+        claimedTime: withdrawal.claimedTime,
+        message: withdrawal.message
       })
     );
-    usdcToken.transfer(msg.sender, usdc);
+  }
+
+  function finalizeWithdrawal(bytes32 message) external nonReentrant whenNotPaused {
+    require(!finalizedWithdrawals[message], "Withdrawal already finalized");
+    Withdrawal memory withdrawal = claimedWithdrawals[message];
+
+    require(
+      block.timestamp > withdrawal.claimedTime + disputePeriodSeconds,
+      "Withdrawal still in dispute period"
+    );
+    finalizedWithdrawals[message] = true;
+    usdcToken.transfer(withdrawal.user, withdrawal.usdc);
+    emit FinalizedWithdrawal(
+      FinalizedWithdrawalEvent({
+        user: withdrawal.user,
+        usdc: withdrawal.usdc,
+        nonce: withdrawal.nonce,
+        message: withdrawal.message
+      })
+    );
   }
 
   // Utility function that verifies the signatures supplied and checks that the validators have reached quorum.
@@ -164,25 +274,26 @@ contract Bridge is Ownable, Pausable, ReentrancyGuard {
     bytes32 message,
     ValidatorSet memory curValidatorSet, // Current set of all L1 validators
     address[] memory signers, // Subsequence of the current L1 validators that signed the message
-    Signature[] memory signatures
+    Signature[] memory signatures,
+    bytes32 validatorSetHash
   ) private view {
     require(
-      makeCheckpoint(curValidatorSet) == validatorSetCheckpoint,
+      makeValidatorSetHash(curValidatorSet) == validatorSetHash,
       "Supplied current validators and powers do not match the current checkpoint"
     );
 
-    uint256 nSigners = signers.length;
+    uint64 nSigners = uint64(signers.length);
     require(nSigners > 0, "Signers empty");
     require(nSigners == signatures.length, "Signatures and signers have different lengths");
 
-    uint256 cumulativePower;
-    uint256 signerIdx;
-    uint256 end = curValidatorSet.validators.length;
+    uint64 cumulativePower;
+    uint64 signerIdx;
+    uint64 end = uint64(curValidatorSet.validators.length);
 
-    for (uint256 curValidatorSetIdx; curValidatorSetIdx < end; curValidatorSetIdx++) {
+    for (uint64 curValidatorSetIdx; curValidatorSetIdx < end; curValidatorSetIdx++) {
       address signer = signers[signerIdx];
       if (signer == curValidatorSet.validators[curValidatorSetIdx]) {
-        uint256 power = curValidatorSet.powers[curValidatorSetIdx];
+        uint64 power = curValidatorSet.powers[curValidatorSetIdx];
         require(
           recoverSigner(message, signatures[signerIdx], domainSeparator) == signer,
           "Validator signature does not match"
@@ -209,42 +320,130 @@ contract Bridge is Ownable, Pausable, ReentrancyGuard {
   // This function updates the validator set by checking that the current validators have signed
   // off on the new validator set
   function updateValidatorSet(
-    ValidatorSet memory newValidatorSet,
-    ValidatorSet memory curValidatorSet,
+    ValidatorSetUpdateRequest memory newValidatorSet,
+    ValidatorSet memory curHotValidatorSet,
     address[] memory signers,
     Signature[] memory signatures
   ) external whenNotPaused {
     require(
-      makeCheckpoint(curValidatorSet) == validatorSetCheckpoint,
+      makeValidatorSetHash(curHotValidatorSet) == hotValidatorSetHash,
       "Supplied current validators and powers do not match checkpoint"
     );
 
     require(
-      newValidatorSet.epoch > curValidatorSet.epoch,
+      newValidatorSet.hotAddresses.length == newValidatorSet.coldAddresses.length,
+      "New hot and cold validator sets length mismatch"
+    );
+
+    require(
+      newValidatorSet.hotAddresses.length == newValidatorSet.powers.length,
+      "New validator set and powers length mismatch"
+    );
+
+    require(
+      newValidatorSet.epoch > curHotValidatorSet.epoch,
       "New validator set epoch must be greater than the current epoch"
     );
 
-    uint256 cumulativePower = checkNewValidatorPowers(newValidatorSet.powers);
-    bytes32 newCheckpoint = makeCheckpoint(newValidatorSet);
-    Agent memory agent = Agent("a", newCheckpoint);
-    bytes32 message = hash(agent);
-    checkValidatorSignatures(message, curValidatorSet, signers, signatures);
-    validatorSetCheckpoint = newCheckpoint;
-    epoch = newValidatorSet.epoch;
-    powerThreshold = (2 * cumulativePower) / 3;
-    nValidators = newValidatorSet.validators.length;
+    uint64 cumulativePower = checkNewValidatorPowers(newValidatorSet.powers);
 
-    emit ValidatorSetUpdatedEvent(
+    Agent memory agent = Agent(
+      "a",
+      keccak256(
+        abi.encode(
+          newValidatorSet.epoch,
+          newValidatorSet.hotAddresses,
+          newValidatorSet.coldAddresses,
+          newValidatorSet.powers
+        )
+      )
+    );
+    bytes32 message = hash(agent);
+    checkValidatorSignatures(message, curHotValidatorSet, signers, signatures, hotValidatorSetHash);
+
+    ValidatorSet memory newHotValidatorSet;
+    newHotValidatorSet = ValidatorSet({
+      epoch: newValidatorSet.epoch,
+      validators: newValidatorSet.hotAddresses,
+      powers: newValidatorSet.powers
+    });
+    bytes32 newHotValidatorSetHash = makeValidatorSetHash(newHotValidatorSet);
+
+    ValidatorSet memory newColdValidatorSet;
+    newColdValidatorSet = ValidatorSet({
+      epoch: newValidatorSet.epoch,
+      validators: newValidatorSet.coldAddresses,
+      powers: newValidatorSet.powers
+    });
+    bytes32 newColdValidatorSetHash = makeValidatorSetHash(newColdValidatorSet);
+    uint64 newPowerThreshold = (2 * cumulativePower) / 3;
+
+    pendingValidatorSetUpdate = PendingValidatorSetUpdate({
+      epoch: newValidatorSet.epoch,
+      powerThreshold: newPowerThreshold,
+      updateTime: block.timestamp,
+      hotValidatorSetHash: newHotValidatorSetHash,
+      coldValidatorSetHash: newColdValidatorSetHash
+    });
+
+    emit ValidatorSetUpdateRequested(
       newValidatorSet.epoch,
-      newValidatorSet.validators,
+      newValidatorSet.hotAddresses,
+      newValidatorSet.coldAddresses,
       newValidatorSet.powers
     );
   }
 
+  function finalizeValidatorSetUpdate() external nonReentrant whenNotPaused {
+    require(
+      pendingValidatorSetUpdate.updateTime != 0,
+      "Pending validator set update already finalized"
+    );
+
+    require(
+      block.timestamp > pendingValidatorSetUpdate.updateTime + disputePeriodSeconds,
+      "Validator set update still in dispute period"
+    );
+
+    hotValidatorSetHash = pendingValidatorSetUpdate.hotValidatorSetHash;
+    coldValidatorSetHash = pendingValidatorSetUpdate.coldValidatorSetHash;
+    epoch = pendingValidatorSetUpdate.epoch;
+    powerThreshold = pendingValidatorSetUpdate.powerThreshold;
+    nValidators = uint64(pendingValidatorSetUpdate.hotValidatorSetHash.length);
+    pendingValidatorSetUpdate.updateTime = 0;
+
+    emit ValidatorSetUpdateFinalized(epoch, hotValidatorSetHash, coldValidatorSetHash);
+  }
+
+  function modifyLocker(
+    address locker,
+    bool isLocker,
+    uint64 nonce,
+    ValidatorSet calldata curColdValidatorSet,
+    address[] calldata signers,
+    Signature[] memory signatures
+  ) external {
+    Agent memory agent = Agent("a", keccak256(abi.encode(locker, isLocker, nonce)));
+    bytes32 message = hash(agent);
+
+    require(!usedLockerUpdateMessages[message], "Locker message already used");
+
+    checkValidatorSignatures(
+      message,
+      curColdValidatorSet,
+      signers,
+      signatures,
+      coldValidatorSetHash
+    );
+    usedLockerUpdateMessages[message] = true;
+    lockers[locker] = isLocker;
+    emit ModifiedLocker(locker, isLocker);
+  }
+
   // This function checks that the total power of the new validator set is greater than minTotalValidatorPower.
-  function checkNewValidatorPowers(uint256[] memory powers) private view returns (uint256) {
-    uint256 cumulativePower;
-    for (uint256 i; i < powers.length; i++) {
+  function checkNewValidatorPowers(uint64[] memory powers) private view returns (uint64) {
+    uint64 cumulativePower;
+    for (uint64 i; i < powers.length; i++) {
       cumulativePower += powers[i];
     }
 
@@ -255,22 +454,35 @@ contract Bridge is Ownable, Pausable, ReentrancyGuard {
     return cumulativePower;
   }
 
-  // Utility function that returns the block timestamp in milliseconds
-  function blockMillis() private view returns (uint256) {
-    return 1000 * block.timestamp;
-  }
-
   // Ownership will be relinquished on public launch. The owner does not need power to force withdraw,
   // as that is controlled by the initially skewed distribution of L1 stake.
-  function changePowerThreshold(uint256 _powerThreshold) external onlyOwner whenPaused {
+  // NOLAUNCH should be signed by validators' cold keys
+  function changePowerThreshold(uint64 _powerThreshold) external onlyOwner whenPaused {
     powerThreshold = _powerThreshold;
   }
 
-  function emergencyPause() external onlyOwner {
+  function emergencyLock() external {
+    require(lockers[msg.sender], "Sender is not authorized to lock smart contract");
     _pause();
   }
 
-  function emergencyUnpause() external onlyOwner {
+  function emergencyUnlock(
+    uint64 nonce,
+    ValidatorSet calldata curColdValidatorSet,
+    address[] calldata signers,
+    Signature[] calldata signatures
+  ) external {
+    Agent memory agent = Agent("a", keccak256(abi.encode("unlock", nonce)));
+    bytes32 message = hash(agent);
+
+    require(!usedUnlockMessages[message], "Unlocking request message already used");
+    checkValidatorSignatures(
+      message,
+      curColdValidatorSet,
+      signers,
+      signatures,
+      coldValidatorSetHash
+    );
     _unpause();
   }
 }
