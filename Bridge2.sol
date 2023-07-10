@@ -169,7 +169,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   event RequestedValidatorSetUpdate(RequestedValidatorSetUpdateEvent e);
   event FinalizedValidatorSetUpdate(FinalizedValidatorSetUpdateEvent e);
   event ModifiedLocker(address indexed locker, bool isLocker);
-  event ModifiedFinalizer(address indexed finalzier, bool isFinalizer);
+  event ModifiedFinalizer(address indexed finalizer, bool isFinalizer);
   event ChangedDisputePeriodSeconds(uint64 newDisputePeriodSeconds);
   event ChangedBlockDurationMillis(uint64 newBlockDurationMillis);
 
@@ -304,7 +304,6 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   }
 
   function finalizeWithdrawal(bytes32 message) private nonReentrant whenNotPaused {
-    checkFinalizer(msg.sender);
     require(!finalizedWithdrawals[message], "Withdrawal already finalized");
     Withdrawal memory withdrawal = requestedWithdrawals[message];
 
@@ -325,6 +324,8 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   function batchedFinalizeWithdrawals(
     bytes32[] calldata messages
   ) external nonReentrant whenNotPaused {
+    checkFinalizer(msg.sender);
+
     uint64 end = uint64(messages.length);
     for (uint64 idx; idx < end; idx++) {
       finalizeWithdrawal(messages[idx]);
@@ -642,7 +643,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   ) external whenPaused {
     Agent memory agent = Agent(
       "a",
-      keccak256(abi.encode("changeblockDurationMillis", newBlockDurationMillis, nonce))
+      keccak256(abi.encode("changeBlockDurationMillis", newBlockDurationMillis, nonce))
     );
     bytes32 message = hash(agent);
     checkMessageNotUsed(message);

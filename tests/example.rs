@@ -772,7 +772,7 @@ async fn bridge2_locking_test() {
     assert_eq!(res, new_dispute_period_seconds);
 
     let new_block_duration_millis = U256::from(200);
-    let hash = utils::keccak(("changeblockDurationMillis".to_string(), new_block_duration_millis, nonce));
+    let hash = utils::keccak(("changeBlockDurationMillis".to_string(), new_block_duration_millis, nonce));
     let signature = chain.sign_phantom_agent(hash, &cold_wallet);
     chain
         .bridge2_cid()
