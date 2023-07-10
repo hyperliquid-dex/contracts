@@ -1,4 +1,4 @@
-// This test spins up tendermint, abci, and hardhat servers in separate threads.
+// This integration test spins up local tendermint, abci, and hardhat servers.
 //
 // NOTE: This does not compile without all Chameleon Trading rust dependencies.
 //
@@ -9,95 +9,192 @@
 //
 // The most relevant tests that isolate the bridge being audited are
 // bridge2_withdrawal_tests and bridge2_update_validator_tests
+//
+// Note that bridge_watcher2 is a task that polls for events emitted by Bridge2 and sends the
+// required validator set update and finalization transactions. See Bridge2.sol for details.
 
 use crate::prelude::*;
 use crate::{
     abci_state::AbciStateBuilder,
-    bridge2::{ValidatorSet, WithdrawalVoucher2},
-    bridge_watcher::{run as run_bridge_watcher, DepositEvent},
-    bridge_watcher2::run as run_bridge_watcher2,
-    etherscan::TXS,
+    action::{owner_mint_token_for::OwnerMintTokenForAction, token_delegate::TokenDelegateAction},
+    bridge2::{
+        finalize_validator_set_update, sign_and_update_validator_set, SolValidatorSet, SolValidatorSetUpdate,
+        ValidatorProfile, WithdrawalVoucher2,
+    },
+    bridge_watcher2::spawn as spawn_bridge_watcher2,
+    cancel_response::{FCancelResponse, FCancelStatus},
+    etherscan_tx_tracker::TXS,
     hyper_abci::{HyperAbci, ReplicaAbciCmd},
+    order_response::{FOrderResponse, FOrderStatus},
+    replicator::DbInit,
+    run_web_server::WebServerConfig,
+    signed_action::FSignedActionSuccess,
+    tendermint_init::{TendermintHome, TendermintInit},
 };
 use ethers::prelude::k256::ecdsa::SigningKey;
-use infra::shell;
-
-async fn setup() -> Recver<ReplicaAbciCmd> {
-    assert!(!*NODES_RUNNING.lock());
-    *NODES_RUNNING.lock() = true;
-    utils::spawn_and_reset_tendermint_node(None, None);
-    let (sender, recver) = channel();
-    let hyper_abci = HyperAbci::new(AbciStateBuilder::New { chain: Chain::Local }, sender, false);
-    std::thread::spawn(move || hyper_abci.run_server_blocking(None));
-    spawn_hardhat_node().await;
-    lu::async_sleep(Duration(1.)).await;
-    recver
-}
+use infra::{set, shell};
+use std::sync::atomic::AtomicBool;
 
 #[tokio::test]
-async fn node_test() {
-    if shell("which tendermint".to_string()).output().is_err() {
-        // TODO do additional checks here to make sure we're in CI?
+async fn integration_tests() {
+    if tu::ci() {
         return;
     }
     let recver = setup().await;
     EthClient::skip_api_validation();
 
     let chain = Chain::Local;
+    let http_client = Arc::new(HttpClient::new(Some(ApiUrl::localhost(3002))));
     let owner_eth_client = chain.eth_client(Nickname::Owner).await;
-    let not_owner_eth_client = chain.eth_client(Nickname::MarketMaker0).await;
-    owner_eth_client.send_eth(not_owner_eth_client.address(), 1.).await.unwrap();
+    let user_eth_client = chain.eth_client(Nickname::User).await;
+    owner_eth_client.send_eth(user_eth_client.address(), 1.).await.unwrap();
+    let user_eth_client = chain.eth_client(Nickname::User).await;
+    owner_eth_client.send_eth(user_eth_client.address(), 1.).await.unwrap();
+    owner_eth_client.send_eth(tu::main_validator_hot_user().to_address(), 1.).await.unwrap();
 
+    let db_hub = DbHub::test();
+    let replicator = Arc::new(
+        ReplicatorBuilder::new(
+            db_hub.clone(),
+            DbInit::Legacy,
+            AbciStateBuilder::New { chain }.build(),
+            Some(tu::aux_core()),
+            Ipv4Addr::LOCALHOST,
+            recver,
+        )
+        .build()
+        .await,
+    );
+
+    {
+        let replicator = Arc::clone(&replicator);
+        tokio::spawn(async move {
+            setup_web_server(db_hub, replicator).await;
+        });
+    }
+    let tx_batcher = Arc::new(TxBatcher::new(Ipv4Addr::LOCALHOST).await);
+    spawn_bridge_watcher2(replicator.abci_state(), tx_batcher, true).await;
+
+    lu::async_sleep(Duration(1.)).await;
+    l1_test(&http_client).await;
+    bridge_end_to_end_test(&http_client, &replicator).await;
+    bridge2_end_to_end_test(&http_client, &replicator).await;
+    bridge2_update_validator_tests().await;
+    bridge2_withdrawal_tests().await;
+    bridge2_locking_test().await;
+}
+
+async fn bridge2_end_to_end_test(http_client: &Arc<HttpClient>, replicator: &Arc<Replicator>) {
+    use crate::bridge_watcher2::DepositEvent;
+
+    let chain = Chain::Local;
+    let eth_chain = chain.eth_chain();
+    let owner_eth_client = chain.eth_client(Nickname::Owner).await;
+    assert!(replicator.lock(|e| e.has_bridge2(), "integration_test_has_bridge2"));
+    lu::async_sleep(Duration(1.)).await;
+    let active_epoch = replicator.lock(|e| e.staking().active_epoch(), "integration_test_active_epoch");
+    assert_eq!(
+        replicator.lock(
+            |e| e.staking().validator_to_hot_user(tu::main_validator(), active_epoch).unwrap(),
+            "integration_test_validator_to_hot_user"
+        ),
+        tu::main_validator_hot_user()
+    );
+
+    let amount = 10.0;
+    let amount_u64 = amount.with_decimals(USDC_ERC20_DECIMALS);
+
+    let user = User::new(owner_eth_client.address());
+    let action = Box::new(OwnerMintTokenForAction { amount: 99, user });
     let owner_wallet = Nickname::Owner.wallet(chain);
+    let signed_action = SignedAction::new(action, &owner_wallet).unwrap();
+    http_client.send_signed_action(signed_action).await.unwrap().unwrap();
 
-    let replicator = Arc::new(Replicator::new(AbciStateBuilder::New { chain }.build(), recver, None).await);
-    let tx_batcher = Arc::new(TxBatcher::new("127.0.0.1").await);
-    let initial_account_value = account_value(&replicator, User::new(owner_eth_client.address()));
+    let action = Box::new(TokenDelegateAction { validator: tu::main_validator(), amount: 99 });
+    let signed_action = SignedAction::new(action, &owner_wallet).unwrap();
+    http_client.send_signed_action(signed_action).await.unwrap().unwrap();
 
+    let bridge2_cid = chain.bridge2_cid();
+    chain.usdc_cid().send("approve", (bridge2_cid.address(eth_chain), u64::MAX), &owner_eth_client).await.unwrap();
+    let tx_receipt = bridge2_cid.send("deposit", amount_u64, &owner_eth_client).await.unwrap();
+    TXS.lock().entry(bridge2_cid.address(eth_chain)).or_default().insert(tx_receipt.transaction_hash);
+
+    lu::async_sleep(Duration(3.)).await;
+    let deposit_events: Vec<DepositEvent> = owner_eth_client.parse_events(bridge2_cid, tx_receipt);
+    let DepositEvent { usdc, .. } = *deposit_events.first().unwrap();
+    assert_eq!(usdc.to_string(), "10000000");
+
+    let action = Box::new(WithdrawAction { nonce: 0, usd: amount_u64 });
+    let signed_action = SignedAction::new(action, &owner_wallet).unwrap();
+    http_client.send_signed_action(signed_action).await.unwrap().unwrap();
+
+    lu::async_sleep(Duration(8.)).await;
+    let claimable_withdrawals =
+        replicator.lock(|e| e.claimable_withdrawals(user), "integration_test_claimable_withdrawals");
+    assert!(!claimable_withdrawals.is_empty());
+    let withdrawal_voucher = claimable_withdrawals.first().unwrap();
+    assert_eq!(withdrawal_voucher.signers, vec![tu::main_validator_hot_user()]);
+    warn!("withdrawing from bridge2" => withdrawal_voucher, active_epoch);
+
+    // NOSHIP write test for claiming and finalizing withdrawal successfully, too early, failure on multiple times
+}
+
+async fn l1_test(http_client: &Arc<HttpClient>) {
+    let chain = Chain::Local;
+    let owner_wallet = Nickname::Owner.wallet(chain);
     let user_wallet = tu::wallet(1);
     let agent_wallet = tu::wallet(4);
     let req = utils::approve_agent_action(&user_wallet, &agent_wallet).unwrap();
 
-    tx_batcher.send_signed_action(req).await.unwrap();
+    http_client.send_signed_action(req).await.unwrap().unwrap();
 
-    tx_batcher
+    http_client
         .send_signed_action(
             SignedAction::new(
-                Box::new(RegisterAssetAction { coin: "ETH".to_string(), sz_decimals: 1, oracle_px: 1000. }),
+                Box::new(RegisterAssetAction {
+                    coin: "ETH".to_string(),
+                    sz_decimals: 1,
+                    oracle_px: 1000.,
+                    max_leverage: 50,
+                }),
                 &owner_wallet,
             )
             .unwrap(),
         )
         .await
+        .unwrap()
         .unwrap();
-    tx_batcher
+    http_client
         .send_signed_action(
             SignedAction::new(
-                Box::new(RegisterAssetAction { coin: "BTC".to_string(), sz_decimals: 1, oracle_px: 1000. }),
+                Box::new(RegisterAssetAction {
+                    coin: "BTC".to_string(),
+                    sz_decimals: 1,
+                    oracle_px: 1000.,
+                    max_leverage: 50,
+                }),
                 &owner_wallet,
             )
             .unwrap(),
         )
         .await
+        .unwrap()
         .unwrap();
 
     let action = tu::o(1, Side::Bid, 123400000., 1.).into_action();
     let req = SignedAction::new(action, &agent_wallet).unwrap();
-    let resp = tx_batcher.send_signed_action(req).await.unwrap();
-    let FResult::Ok(SignedActionSuccess::Order(OrderResponse { statuses })) = resp else {
+    let resp = http_client.send_signed_action(req).await.unwrap().unwrap();
+    let FSignedActionSuccess::Order(FOrderResponse { statuses }) = resp else {
         unreachable!("{resp:?}")
     };
 
     assert_eq!(statuses.len(), 1);
-    assert!(
-        u::serde_eq(&statuses[0], &OrderStatus::Error("Insufficient margin to place order.".to_string())),
-        "{statuses:?}"
-    );
+    assert_eq!(statuses[0], FOrderStatus::Error("Insufficient margin to place order.".to_string()));
 
     let cancel_action = CancelAction { cancels: vec![Cancel { asset: 0, oid: 123 }] };
     let req = SignedAction::new(Box::new(cancel_action), &agent_wallet).unwrap();
-    let resp = tx_batcher.send_signed_action(req).await.unwrap();
-    let FResult::Ok(SignedActionSuccess::Cancel(CancelResponse {statuses})) = resp else {
+    let resp = http_client.send_signed_action(req).await.unwrap().unwrap();
+    let FSignedActionSuccess::Cancel(FCancelResponse { statuses }) = resp else {
         unreachable!("{resp:?}")
     };
 
@@ -105,39 +202,232 @@ async fn node_test() {
     assert!(
         u::serde_eq(
             &statuses[0],
-            &CancelStatus::Error("Order was never placed, already canceled, or filled.".to_string())
+            &FCancelStatus::Error("Order was never placed, already canceled, or filled.".to_string())
         ),
         "{statuses:?}"
     );
+}
 
-    run_bridge_watcher(chain, Arc::clone(&replicator), Arc::clone(&tx_batcher)).await;
+async fn bridge2_update_validator_tests() {
+    // NOSHIP test validator set updates with cold keys different than hot keys
+    let chain = Chain::Local;
+    let eth_chain = chain.eth_chain();
+    let eth_client = tu::main_validator_eth_client().await;
+    let wallet0 = tu::main_validator_hot_wallet();
+    let wallet1 = tu::wallet(1);
+    let wallet2 = tu::wallet(2);
+
+    let user0 = tu::main_validator_hot_user();
+    let user1 = wallet1.address().into();
+    let user2 = wallet2.address().into();
+
+    warn!("running bridge2_update_validator_tests" => user0, user1, user2, eth_client.address());
+    let cur_epoch: u64 = chain.bridge2_cid().call("epoch", (), &eth_client).await.unwrap();
+    let new_epoch = cur_epoch + 1;
+    let active_validator_set = initial_validator_set();
+    let new_validator_set = set![
+        ValidatorProfile { power: 50, hot_user: user0, cold_user: user0 },
+        ValidatorProfile { power: 50, hot_user: user1, cold_user: user1 }
+    ];
+    sign_and_update_validator_set(
+        &eth_client,
+        chain,
+        &active_validator_set,
+        &new_validator_set,
+        cur_epoch,
+        new_epoch,
+        &[wallet0.clone()],
+    )
+    .await
+    .unwrap();
+    finalize_validator_set_update(&eth_client, chain).await.unwrap();
+
+    let cur_epoch = new_epoch;
+    let new_epoch = cur_epoch + 1;
+    let active_validator_set = new_validator_set;
+    let new_validator_set = set![
+        ValidatorProfile { power: 50, hot_user: user0, cold_user: user0 },
+        ValidatorProfile { power: 25, hot_user: user1, cold_user: user1 },
+        ValidatorProfile { power: 25, hot_user: user2, cold_user: user2 },
+    ];
+    sign_and_update_validator_set(
+        &eth_client,
+        chain,
+        &active_validator_set,
+        &new_validator_set,
+        cur_epoch,
+        new_epoch,
+        &[wallet0.clone(), wallet1.clone()],
+    )
+    .await
+    .unwrap();
+    finalize_validator_set_update(&eth_client, chain).await.unwrap();
 
     let amount = 10.0;
-    let owner_usdc_amount = (5. * amount).with_decimals(USDC_ERC20_DECIMALS);
-    let not_owner_eth_client_usdc_amount = (3. * amount).with_decimals(USDC_ERC20_DECIMALS);
+    let usd = amount.with_decimals(USDC_ERC20_DECIMALS);
+    let nonce = 0;
+    let hash = utils::keccak((user0.raw(), usd, nonce));
+    let signatures = vec![chain.sign_phantom_agent(hash, &wallet0)];
+    let withdrawal_voucher_no_quorum = WithdrawalVoucher2 {
+        usd,
+        nonce,
+        active_validator_set: new_validator_set.clone(),
+        signers: vec![user0],
+        signatures,
+    };
 
-    chain
-        .usdc_cid()
-        .send("mint", owner_usdc_amount + not_owner_eth_client_usdc_amount, &owner_eth_client)
-        .await
-        .unwrap();
-    chain
-        .usdc_cid()
-        .send("transfer", (not_owner_eth_client.address(), not_owner_eth_client_usdc_amount), &owner_eth_client)
-        .await
-        .unwrap();
-    chain
-        .usdc_cid()
-        .send("approve", (chain.bridge_cid().address(owner_eth_client.chain()), owner_usdc_amount), &owner_eth_client)
-        .await
-        .unwrap();
-    chain
-        .usdc_cid()
+    let res = tu::bridge2_withdrawal(&chain, &eth_client, withdrawal_voucher_no_quorum, new_epoch).await;
+    tu::assert_err(res, "Submitted validator set signatures do not have enough power");
+
+    chain.usdc_cid().send("approve", (chain.bridge2_cid().address(eth_chain), u64::MAX), &eth_client).await.unwrap();
+    let owner_eth_client = chain.eth_client(Nickname::Owner).await;
+    chain.usdc_cid().send("transfer", (user0.raw(), usd), &owner_eth_client).await.unwrap();
+    chain.bridge2_cid().send("deposit", usd, &eth_client).await.unwrap();
+
+    let cur_epoch = new_epoch;
+    let new_epoch = cur_epoch + 1;
+    let sol_new_validator_set = SolValidatorSetUpdate::from_validator_set(new_epoch, &new_validator_set);
+    let sol_active_validator_set = SolValidatorSet::from_hot_validator_set(cur_epoch, &active_validator_set);
+    let sol_new_validator_set_hash = sol_new_validator_set.hash();
+    let mut signatures = Vec::new();
+    for validator in [&wallet0, &wallet1, &wallet2] {
+        signatures.push(chain.sign_phantom_agent(sol_new_validator_set_hash, validator));
+    }
+    let signers: Vec<_> = active_validator_set.iter().rev().map(|x| x.hot_user.raw()).collect();
+    let res = chain
+        .bridge2_cid()
         .send(
-            "approve",
-            (chain.bridge_cid().address(owner_eth_client.chain()), not_owner_eth_client_usdc_amount),
-            &not_owner_eth_client,
+            "updateValidatorSet",
+            (sol_new_validator_set.clone(), sol_active_validator_set.clone(), signers, signatures.clone()),
+            &eth_client,
         )
+        .await;
+
+    tu::assert_err(res, "Supplied active validators and powers do not match checkpoint");
+
+    let active_validator_set = set![
+        ValidatorProfile { power: 50, hot_user: user0, cold_user: user0 },
+        ValidatorProfile { power: 25, hot_user: user1, cold_user: user1 },
+        ValidatorProfile { power: 25, hot_user: user2, cold_user: user2 },
+    ];
+    let sol_new_validator_set = SolValidatorSetUpdate::from_validator_set(cur_epoch, &active_validator_set);
+    let sol_active_validator_set = SolValidatorSet::from_hot_validator_set(cur_epoch, &active_validator_set);
+    let res = chain
+        .bridge2_cid()
+        .send(
+            "updateValidatorSet",
+            (
+                sol_new_validator_set.clone(),
+                sol_active_validator_set.clone(),
+                sol_active_validator_set.validators.clone(),
+                signatures.clone(),
+            ),
+            &eth_client,
+        )
+        .await;
+    tu::assert_err(res, "New validator set epoch must be greater than the active epoch");
+
+    let mut wrong_signatures = Vec::new();
+    for validator in &[&wallet1, &wallet2, &wallet2] {
+        wrong_signatures.push(chain.sign_phantom_agent(sol_new_validator_set.hash(), validator));
+    }
+    let sol_new_validator_set = SolValidatorSetUpdate::from_validator_set(new_epoch, &active_validator_set);
+    let res = chain
+        .bridge2_cid()
+        .send(
+            "updateValidatorSet",
+            (
+                sol_new_validator_set.clone(),
+                sol_active_validator_set.clone(),
+                sol_active_validator_set.validators.clone(),
+                wrong_signatures,
+            ),
+            &eth_client,
+        )
+        .await;
+    tu::assert_err(res, "Validator signature does not match");
+
+    let no_quorum_signatures = vec![chain.sign_phantom_agent(sol_new_validator_set.hash(), &wallet1)];
+    let res = chain
+        .bridge2_cid()
+        .send(
+            "updateValidatorSet",
+            (sol_new_validator_set, sol_active_validator_set.clone(), vec![user1.raw()], no_quorum_signatures),
+            &eth_client,
+        )
+        .await;
+    tu::assert_err(res, "Submitted validator set signatures do not have enough power");
+
+    let new_validator_wallets = utils::wallet_range(100);
+    let new_validator_set = new_validator_wallets
+        .iter()
+        .enumerate()
+        .map(|(u, wallet)| ValidatorProfile {
+            power: (100 - u) as u64,
+            hot_user: wallet.address().into(),
+            cold_user: wallet.address().into(),
+        })
+        .collect();
+    let active_validator_set = set![
+        ValidatorProfile { power: 50, hot_user: user0, cold_user: user0 },
+        ValidatorProfile { power: 25, hot_user: user1, cold_user: user1 },
+        ValidatorProfile { power: 25, hot_user: user2, cold_user: user2 },
+    ];
+    let wallets = [wallet0.clone(), wallet1.clone(), wallet2.clone()];
+    sign_and_update_validator_set(
+        &eth_client,
+        chain,
+        &active_validator_set,
+        &new_validator_set,
+        cur_epoch,
+        new_epoch,
+        &wallets,
+    )
+    .await
+    .unwrap();
+    finalize_validator_set_update(&eth_client, chain).await.unwrap();
+
+    let cur_epoch = new_epoch;
+    let new_epoch = cur_epoch + 1;
+    let active_validator_set = new_validator_set;
+    let new_validator_set = initial_validator_set();
+    sign_and_update_validator_set(
+        &eth_client,
+        chain,
+        &active_validator_set,
+        &new_validator_set,
+        cur_epoch,
+        new_epoch,
+        new_validator_wallets.as_slice(),
+    )
+    .await
+    .unwrap();
+    finalize_validator_set_update(&eth_client, chain).await.unwrap();
+}
+
+async fn bridge_end_to_end_test(http_client: &Arc<HttpClient>, replicator: &Arc<Replicator>) {
+    use crate::bridge_watcher::DepositEvent;
+    warn!("starting bridge_end_to_end_test");
+    let chain = Chain::Local;
+    let owner_eth_client = chain.eth_client(Nickname::Owner).await;
+    let user_eth_client = chain.eth_client(Nickname::User).await;
+
+    let initial_account_value = account_value(replicator, User::new(owner_eth_client.address()));
+    let amount = 11.;
+    let owner_usdc_amount = (5. * amount).with_decimals(USDC_ERC20_DECIMALS);
+    let user_usdc_amount = (3. * amount).with_decimals(USDC_ERC20_DECIMALS);
+
+    let bridge_cid = chain.bridge_cid();
+    chain.usdc_cid().send("mint", owner_usdc_amount + user_usdc_amount, &owner_eth_client).await.unwrap();
+    chain.usdc_cid().send("transfer", (user_eth_client.address(), user_usdc_amount), &owner_eth_client).await.unwrap();
+    chain
+        .usdc_cid()
+        .send("approve", (bridge_cid.address(owner_eth_client.chain()), owner_usdc_amount), &owner_eth_client)
+        .await
+        .unwrap();
+    chain
+        .usdc_cid()
+        .send("approve", (bridge_cid.address(owner_eth_client.chain()), user_usdc_amount), &user_eth_client)
         .await
         .unwrap();
 
@@ -145,49 +435,55 @@ async fn node_test() {
         chain.usdc_cid().call("balanceOf", owner_eth_client.address(), &owner_eth_client).await.unwrap();
     assert_eq!(initial_owner_usdc_balance, owner_usdc_amount);
     let initial_not_owner_eth_client_usdc_balance: u64 =
-        chain.usdc_cid().call("balanceOf", not_owner_eth_client.address(), &owner_eth_client).await.unwrap();
-    assert_eq!(initial_not_owner_eth_client_usdc_balance, not_owner_eth_client_usdc_amount);
+        chain.usdc_cid().call("balanceOf", user_eth_client.address(), &owner_eth_client).await.unwrap();
+    assert_eq!(initial_not_owner_eth_client_usdc_balance, user_usdc_amount);
+    let initial_user_usdc_balance: u64 =
+        chain.usdc_cid().call("balanceOf", user_eth_client.address(), &owner_eth_client).await.unwrap();
+    assert_eq!(initial_user_usdc_balance, user_usdc_amount);
+
+    let bridge_cid = chain.bridge_cid();
+    let tx_receipt =
+        bridge_cid.send("deposit", amount.with_decimals(USDC_ERC20_DECIMALS), &owner_eth_client).await.unwrap();
+    let tx_hash = tx_receipt.clone().transaction_hash;
+    TXS.lock().entry(bridge_cid.address(chain.eth_chain())).or_default().insert(tx_hash);
 
     let tx_receipt =
-        chain.bridge_cid().send("deposit", amount.with_decimals(USDC_ERC20_DECIMALS), &owner_eth_client).await.unwrap();
+        bridge_cid.send("deposit", amount.with_decimals(USDC_ERC20_DECIMALS), &owner_eth_client).await.unwrap();
     let tx_hash = tx_receipt.clone().transaction_hash;
-    TXS.lock().insert(tx_hash);
+    TXS.lock().entry(bridge_cid.address(chain.eth_chain())).or_default().insert(tx_hash);
 
-    let tx_receipt =
-        chain.bridge_cid().send("deposit", amount.with_decimals(USDC_ERC20_DECIMALS), &owner_eth_client).await.unwrap();
-    let tx_hash = tx_receipt.clone().transaction_hash;
-    TXS.lock().insert(tx_hash);
+    lu::async_sleep(Duration(5.)).await;
 
-    lu::async_sleep(Duration(3.)).await;
-
-    let deposit_events: Vec<DepositEvent> = owner_eth_client.parse_events(chain.bridge_cid(), tx_receipt);
+    let deposit_events: Vec<DepositEvent> = owner_eth_client.parse_events(bridge_cid, tx_receipt);
     let DepositEvent { user, usdc, .. } = *deposit_events.first().unwrap();
-    assert_eq!(usdc.to_string(), "10000000");
+    assert_eq!(usdc.to_string(), "11000000");
     assert_eq!(user, owner_eth_client.address().raw());
-    let final_account_value = account_value(&replicator, User::new(owner_eth_client.address()));
+    let final_account_value = account_value(replicator, User::new(owner_eth_client.address()));
 
-    warn!("should have deposited" => initial_account_value, final_account_value, owner_eth_client.address());
+    warn!("should have deposited" => initial_account_value, final_account_value, owner_eth_client.address(), deposit_events);
     assert_eq!(final_account_value - initial_account_value, 2. * amount);
-    let initial_account_value = account_value(&replicator, User::new(owner_eth_client.address()));
+    let initial_account_value = account_value(replicator, User::new(owner_eth_client.address()));
 
     let nonce = 1;
-    let withdraw_amount = 10.0.with_decimals(USDC_ERC20_DECIMALS);
-    let withdraw_action = WithdrawAction { usd: withdraw_amount, nonce };
+    let withdraw_amount = 10.;
+    let usd = withdraw_amount.with_decimals(USDC_ERC20_DECIMALS);
+    let withdraw_action = WithdrawAction { usd, nonce };
 
     let signing_key = SigningKey::from_bytes(&owner_eth_client.key().to_fixed_bytes()).unwrap();
     let owner_wallet = Wallet::from(signing_key);
-    let agent_wallet = tu::wallet(5);
-    let req = utils::approve_agent_action(&owner_wallet, &agent_wallet).unwrap();
-    tx_batcher.send_signed_action(req).await.unwrap();
+    let owner_agent = tu::wallet(5);
+    let req = utils::approve_agent_action(&owner_wallet, &owner_agent).unwrap();
+    http_client.send_signed_action(req).await.unwrap().unwrap();
 
-    let req = SignedAction::new(Box::new(withdraw_action), &agent_wallet).unwrap();
-    tx_batcher.send_signed_action(req).await.unwrap();
+    let req = SignedAction::new(Box::new(withdraw_action), &owner_agent).unwrap();
+    http_client.send_signed_action(req).await.unwrap().unwrap();
 
-    let user = User::new(owner_eth_client.address());
-    let final_account_value = account_value(&replicator, user);
-    assert_eq!(initial_account_value - final_account_value, amount);
+    let owner = User::new(owner_eth_client.address());
+    let final_account_value = account_value(replicator, owner);
+    assert_eq!(initial_account_value - final_account_value, withdraw_amount);
 
-    let mut pending_withdrawals = replicator.bridge_cloned().pending_withdrawals(user).unwrap().clone();
+    let mut pending_withdrawals = replicator
+        .lock(|e| e.bridge().pending_withdrawals(owner).unwrap().clone(), "integration_test_pending_withdrawals");
     assert!(pending_withdrawals.len() == 1);
     let withdrawal_voucher = pending_withdrawals.pop().unwrap();
     warn!("pending withdrawal" => withdrawal_voucher);
@@ -199,364 +495,134 @@ async fn node_test() {
 
     let tx_receipt = claim_withdrawal_on_bridge(chain, withdrawal_voucher.clone(), &owner_eth_client).await.unwrap();
     let tx_hash = tx_receipt.transaction_hash;
-    TXS.lock().insert(tx_hash);
+    TXS.lock().entry(bridge_cid.address(chain.eth_chain())).or_default().insert(tx_hash);
 
     let res = claim_withdrawal_on_bridge(chain, withdrawal_voucher, &owner_eth_client).await;
     assert!(res.err().unwrap().to_string().contains("Already withdrawn."));
 
     lu::async_sleep(Duration(2.)).await;
 
-    let pending_withdrawals = replicator.bridge_cloned().pending_withdrawals(user).unwrap().clone();
-    warn!("should have no pending withdrawals" => user, pending_withdrawals);
+    let pending_withdrawals = replicator
+        .lock(|e| e.bridge().pending_withdrawals(owner).unwrap().clone(), "integration_test_pending_withdrawals");
+    warn!("should have no pending withdrawals" => owner, pending_withdrawals);
 
-    let is_locked: bool = chain.bridge_cid().call("isLocked", (), &owner_eth_client).await.unwrap();
+    let is_locked: bool = bridge_cid.call("isLocked", (), &owner_eth_client).await.unwrap();
     assert!(!is_locked);
-    let res = chain.bridge_cid().send("setIsLocked", true, &not_owner_eth_client).await;
+    let res = bridge_cid.send("setIsLocked", true, &user_eth_client).await;
     tu::assert_err(res, "Ownable: caller is not the owner");
-    chain.bridge_cid().send("setIsLocked", true, &owner_eth_client).await.unwrap();
-    let is_locked: bool = chain.bridge_cid().call("isLocked", (), &owner_eth_client).await.unwrap();
+    bridge_cid.send("setIsLocked", true, &owner_eth_client).await.unwrap();
+    let is_locked: bool = bridge_cid.call("isLocked", (), &owner_eth_client).await.unwrap();
     assert!(is_locked);
 
     let nonce = 2;
-    let withdraw_action = WithdrawAction { usd: withdraw_amount, nonce };
-    let req = SignedAction::new(Box::new(withdraw_action), &agent_wallet).unwrap();
-    tx_batcher.send_signed_action(req).await.unwrap();
-    let mut pending_withdrawals = replicator.bridge_cloned().pending_withdrawals(user).unwrap().clone();
+    let usd = 1.0.with_decimals(USDC_ERC20_DECIMALS);
+    let withdraw_action = WithdrawAction { usd, nonce };
+    let req = SignedAction::new(Box::new(withdraw_action), &owner_agent).unwrap();
+    http_client.send_signed_action(req).await.unwrap().unwrap();
+    let mut pending_withdrawals = replicator
+        .lock(|e| e.bridge().pending_withdrawals(owner).unwrap().clone(), "integration_test_pending_withdrawals");
     let withdrawal_voucher = pending_withdrawals.pop().unwrap();
     let res = claim_withdrawal_on_bridge(chain, withdrawal_voucher, &owner_eth_client).await;
     tu::assert_err(res, "Cannot withdraw/deposit from/to locked bridge");
 
-    let res = chain.bridge_cid().send("withdrawAllUsdcToOwner", (), &not_owner_eth_client).await;
+    let res = bridge_cid.send("withdrawAllUsdcToOwner", (), &user_eth_client).await;
     tu::assert_err(res, "Ownable: caller is not the owner");
-    let bridge_usdc_balance: u64 = chain
-        .usdc_cid()
-        .call("balanceOf", chain.bridge_cid().address(EthChain::Localhost), &owner_eth_client)
-        .await
-        .unwrap();
+    let bridge_usdc_balance: u64 =
+        chain.usdc_cid().call("balanceOf", bridge_cid.address(EthChain::Localhost), &owner_eth_client).await.unwrap();
     let old_owner_usdc_balance: u64 =
         chain.usdc_cid().call("balanceOf", owner_eth_client.address(), &owner_eth_client).await.unwrap();
-    chain.bridge_cid().send("withdrawAllUsdcToOwner", (), &owner_eth_client).await.unwrap();
+    bridge_cid.send("withdrawAllUsdcToOwner", (), &owner_eth_client).await.unwrap();
     let new_owner_usdc_balance: u64 =
         chain.usdc_cid().call("balanceOf", owner_eth_client.address(), &owner_eth_client).await.unwrap();
     assert_eq!(new_owner_usdc_balance, old_owner_usdc_balance + bridge_usdc_balance);
 
     assert!(pending_withdrawals.is_empty());
 
-    chain.bridge_cid().send("setIsLocked", false, &owner_eth_client).await.unwrap();
-    chain.bridge_cid().send("setWhitelistOnly", true, &owner_eth_client).await.unwrap();
-    let res =
-        chain.bridge_cid().send("deposit", amount.with_decimals(USDC_ERC20_DECIMALS), &not_owner_eth_client).await;
+    bridge_cid.send("setIsLocked", false, &owner_eth_client).await.unwrap();
+    bridge_cid.send("setWhitelistOnly", true, &owner_eth_client).await.unwrap();
+    let res = bridge_cid.send("deposit", amount.with_decimals(USDC_ERC20_DECIMALS), &user_eth_client).await;
     tu::assert_err(res, "Sender is not whitelisted");
-    chain
-        .bridge_cid()
-        .send("setUsersWhitelistState", (vec![not_owner_eth_client.address().raw()], true), &owner_eth_client)
+    bridge_cid
+        .send("setUsersWhitelistState", (vec![user_eth_client.address().raw()], true), &owner_eth_client)
         .await
         .unwrap();
-    chain.bridge_cid().send("deposit", amount.with_decimals(USDC_ERC20_DECIMALS), &not_owner_eth_client).await.unwrap();
+    bridge_cid.send("deposit", amount.with_decimals(USDC_ERC20_DECIMALS), &user_eth_client).await.unwrap();
 
-    chain
-        .bridge_cid()
+    bridge_cid
         .send("setMaxDepositPerPeriod", amount.with_decimals(USDC_ERC20_DECIMALS), &owner_eth_client)
         .await
         .unwrap();
     let seconds_per_deposit_period: u64 = 24 * 60 * 60;
-    chain.bridge_cid().send("setSecondsPerDepositPeriod", seconds_per_deposit_period, &owner_eth_client).await.unwrap();
-    let receipt = chain
-        .bridge_cid()
-        .send("deposit", amount.with_decimals(USDC_ERC20_DECIMALS), &not_owner_eth_client)
-        .await
-        .unwrap();
-    let timestamp = not_owner_eth_client.receipt_to_block(&receipt).await.unwrap().timestamp.without_decimals(0);
+    bridge_cid.send("setSecondsPerDepositPeriod", seconds_per_deposit_period, &owner_eth_client).await.unwrap();
+    let receipt =
+        bridge_cid.send("deposit", amount.with_decimals(USDC_ERC20_DECIMALS), &user_eth_client).await.unwrap();
+    let timestamp = user_eth_client.receipt_to_block(&receipt).await.unwrap().timestamp.without_decimals(0);
 
-    let amount_deposited_this_period: u64 = chain
-        .bridge_cid()
+    let amount_deposited_this_period: u64 = bridge_cid
         .call(
             "amountDepositedPerPeriod",
-            (timestamp as u64 / seconds_per_deposit_period, not_owner_eth_client.address().raw()),
-            &not_owner_eth_client,
+            (timestamp as u64 / seconds_per_deposit_period, user_eth_client.address().raw()),
+            &user_eth_client,
         )
         .await
         .unwrap();
     assert_eq!(amount_deposited_this_period, amount.with_decimals(USDC_ERC20_DECIMALS));
-    let res = chain
-        .bridge_cid()
-        .send("deposit", (0.5 * amount).with_decimals(USDC_ERC20_DECIMALS), &not_owner_eth_client)
-        .await;
+    let res = bridge_cid.send("deposit", (0.5 * amount).with_decimals(USDC_ERC20_DECIMALS), &user_eth_client).await;
     tu::assert_err(res, "deposit amount exceeds the maximum for this period");
 
+    let usd = account_value(replicator, owner).with_decimals(USDC_ERC20_DECIMALS);
+    let withdraw_action = WithdrawAction { usd, nonce };
+    let signed_action = SignedAction::new(Box::new(withdraw_action), &owner_agent).unwrap();
+    http_client.send_signed_action(signed_action).await.unwrap().unwrap();
+    assert_eq!(replicator.lock(|e| e.bridge().bal, "integration_test_bridge_bal"), 0);
+
     TXS.lock().clear();
-
-    let start_epoch = bridge2_update_validator_tests().await;
-    bridge2_withdrawal_tests(start_epoch, None).await;
-
-    assert!(replicator.bridge2_cloned().is_some());
-    run_bridge_watcher2(chain, Arc::clone(&replicator), Arc::clone(&tx_batcher)).await;
-    assert_eq!(replicator.validator_user(main_validator()).unwrap(), main_validator_user());
-
-    let action = Box::new(OwnerMintTokenForAction { amount: 99, user });
-    let signed_action = SignedAction::new(action, &owner_wallet).unwrap();
-    tx_batcher.send_signed_action(signed_action).await.unwrap();
-
-    let action = Box::new(TokenDelegateAction { validator: main_validator(), amount: 99 });
-    let signed_action = SignedAction::new(action, &owner_wallet).unwrap();
-    tx_batcher.send_signed_action(signed_action).await.unwrap();
-
-    let tx_receipt = chain
-        .bridge2_cid()
-        .send("deposit", amount.with_decimals(USDC_ERC20_DECIMALS), &owner_eth_client)
-        .await
-        .unwrap();
-    let tx_hash = tx_receipt.clone().transaction_hash;
-    TXS.lock().insert(tx_hash);
-
-    lu::async_sleep(Duration(3.)).await;
-    let deposit_events: Vec<DepositEvent> = owner_eth_client.parse_events(chain.bridge2_cid(), tx_receipt);
-    let DepositEvent { usdc, .. } = *deposit_events.first().unwrap();
-    assert_eq!(usdc.to_string(), "10000000");
-
-    lu::async_sleep(Duration(3.)).await;
-    let claimable_withdrawals = replicator.claimable_withdrawals(user);
-    assert!(!claimable_withdrawals.is_empty());
-    let withdrawal_voucher = claimable_withdrawals.first().unwrap();
-    warn!("withdrawing from bridge2" => withdrawal_voucher);
-
-    let res = tu::bridge2_withdrawal(&chain, &not_owner_eth_client, withdrawal_voucher.clone()).await;
-    tu::assert_err(res, "Validator signature does not match");
-    tu::bridge2_withdrawal(&chain, &owner_eth_client, withdrawal_voucher.clone()).await.unwrap();
-    let res = tu::bridge2_withdrawal(&chain, &owner_eth_client, withdrawal_voucher.clone()).await;
-    tu::assert_err(res, "Already withdrawn");
 }
 
-async fn spawn_hardhat_node() {
-    std::thread::spawn(|| {
-        shell("(cd ~/cham/code/hyperliquid && npx hardhat node) > /tmp/hardhat_out 2>&1".to_string()).wait_check()
-    });
-    lu::async_sleep(Duration(1.)).await;
-    shell("(cd ~/cham/code/hyperliquid && npx hardhat run deploy/contracts.js --network localhost) > /tmp/hardhat_deploy_out 2>&1".to_string()).wait_check();
-}
-
-fn account_value(replicator: &Replicator, user: User) -> f64 {
-    replicator.web_data(Some(user)).user_state.margin_summary.account_value.0
-}
-
-async fn claim_withdrawal_on_bridge(
-    chain: Chain,
-    withdrawal_voucher: WithdrawalVoucher,
-    client: &EthClient,
-) -> infra::Result<Receipt> {
-    let WithdrawalVoucher { signature, action: WithdrawAction { usd, nonce }, .. } = withdrawal_voucher;
-    chain.bridge_cid().send("withdraw", (signature, usd, nonce), client).await
-}
-
-async fn bridge2_update_validator_tests() -> Epoch {
+async fn bridge2_withdrawal_tests() {
     let chain = Chain::Local;
-    let eth_chain = chain.eth_chain();
+    let eth_client = tu::main_validator_eth_client().await;
+    let hot_user = tu::main_validator_hot_user();
+    let hot_wallet = tu::main_validator_hot_wallet();
 
-    let eth_client = chain.eth_client(Nickname::Owner).await;
-    let signing_key = SigningKey::from_bytes(&eth_client.key().to_fixed_bytes()).unwrap();
-
-    let wallet0 = Wallet::from(signing_key);
-    let wallet1 = tu::wallet(1);
-    let wallet2 = tu::wallet(2);
-    let wallet3 = tu::wallet(3);
-
-    let user0 = wallet0.address().into();
-    let user1 = wallet1.address().into();
-    let user2 = wallet2.address().into();
-    let user3 = wallet3.address().into();
-
-    warn!("running bridge2_update_validator_tests" => user0, user1, user2, user3);
-
-    let cur_validator_set = ValidatorSet { epoch: 0, validators: vec![user0], powers: vec![100] };
-    let new_validator_set = ValidatorSet { epoch: 1, validators: vec![user1, user2], powers: vec![50, 50] };
-    utils::update_validator_set(&eth_client, chain, &cur_validator_set, &new_validator_set, &[wallet0]).await.unwrap();
-
-    let cur_validator_set = new_validator_set;
-
-    let new_validator_set = ValidatorSet { epoch: 2, validators: vec![user1, user2, user3], powers: vec![50, 25, 25] };
-    utils::update_validator_set(
-        &eth_client,
-        chain,
-        &cur_validator_set,
-        &new_validator_set,
-        &[wallet1.clone(), wallet2.clone()],
-    )
-    .await
-    .unwrap();
-
-    let amount = 10.0;
-    let usd = amount.with_decimals(USDC_ERC20_DECIMALS);
-    let nonce = 0;
-    let hash = utils::keccak((user0.raw(), usd, nonce));
-    let signatures = vec![utils::phantom_agent(hash).sign_typed_data(chain.eth_chain(), &wallet1).unwrap()];
-    let withdrawal_voucher_no_quorum = WithdrawalVoucher2 {
-        usd,
-        nonce,
-        cur_validator_set: new_validator_set.clone(),
-        signers: vec![user1],
-        signatures,
-    };
-
-    let res = tu::bridge2_withdrawal(&chain, &eth_client, withdrawal_voucher_no_quorum).await;
-    tu::assert_err(res, "Submitted validator set signatures do not have enough power");
-
-    chain.usdc_cid().send("approve", (chain.bridge2_cid().address(eth_chain), u64::MAX), &eth_client).await.unwrap();
-    chain.bridge2_cid().send("deposit", usd, &eth_client).await.unwrap();
-
-    let mut signatures = Vec::new();
-    for wallet in [&wallet1, &wallet2, &wallet3] {
-        signatures.push(utils::phantom_agent(hash).sign_typed_data(eth_chain, wallet).unwrap());
-    }
-    let cur_validator_set = new_validator_set.clone();
-    let withdrawal_voucher = WithdrawalVoucher2 {
-        usd,
-        nonce,
-        cur_validator_set: cur_validator_set.clone(),
-        signers: cur_validator_set.validators.clone(),
-        signatures,
-    };
-    tu::bridge2_withdrawal(&chain, &eth_client, withdrawal_voucher).await.unwrap();
-
-    let new_validator_set = ValidatorSet { epoch: 3, validators: vec![user1, user2, user3], powers: vec![50, 25, 25] };
-    let sol_new_validator_set = new_validator_set.into_sol();
-    let sol_cur_validator_set = sol_new_validator_set.clone();
-
-    let sol_new_validator_set_hash = sol_new_validator_set.hash();
-    let mut signatures = Vec::new();
-    for validator in [&wallet1, &wallet2, &wallet3] {
-        signatures.push(
-            utils::phantom_agent(sol_new_validator_set_hash).sign_typed_data(chain.eth_chain(), validator).unwrap(),
-        );
-    }
-    let res = chain
-        .bridge2_cid()
-        .send(
-            "updateValidatorSet",
-            (
-                sol_new_validator_set.clone(),
-                sol_cur_validator_set.clone(),
-                cur_validator_set.signers(),
-                signatures.clone(),
-            ),
-            &eth_client,
-        )
-        .await;
-    tu::assert_err(res, "Supplied current validators and powers do not match checkpoint");
-
-    let cur_validator_set = ValidatorSet { epoch: 2, validators: vec![user1, user2, user3], powers: vec![50, 25, 25] };
-    let cur_signers = cur_validator_set.signers();
-    let sol_cur_validator_set = cur_validator_set.into_sol();
-    let sol_new_validator_set = sol_cur_validator_set.clone();
-    let res = chain
-        .bridge2_cid()
-        .send(
-            "updateValidatorSet",
-            (
-                sol_new_validator_set,
-                sol_cur_validator_set.clone(),
-                sol_cur_validator_set.validators.clone(),
-                signatures.clone(),
-            ),
-            &eth_client,
-        )
-        .await;
-    tu::assert_err(res, "New validator set epoch must be greater than the current epoch");
-
-    let new_validator_set = ValidatorSet { epoch: 3, validators: vec![user1, user2, user3], powers: vec![50, 25, 25] };
-    let sol_new_validator_set = new_validator_set.into_sol();
-    let mut wrong_signatures = Vec::new();
-    for validator in &[&wallet1, &wallet3, &wallet3] {
-        wrong_signatures.push(
-            utils::phantom_agent(sol_new_validator_set_hash).sign_typed_data(chain.eth_chain(), validator).unwrap(),
-        );
-    }
-    let res = chain
-        .bridge2_cid()
-        .send(
-            "updateValidatorSet",
-            (
-                sol_new_validator_set.clone(),
-                sol_cur_validator_set.clone(),
-                sol_cur_validator_set.validators.clone(),
-                wrong_signatures,
-            ),
-            &eth_client,
-        )
-        .await;
-    tu::assert_err(res, "Validator signature does not match");
-
-    let no_quorum_signatures =
-        vec![utils::phantom_agent(sol_new_validator_set_hash).sign_typed_data(chain.eth_chain(), &wallet1).unwrap()];
-    let res = chain
-        .bridge2_cid()
-        .send(
-            "updateValidatorSet",
-            (sol_new_validator_set, sol_cur_validator_set.clone(), vec![user1.raw()], no_quorum_signatures),
-            &eth_client,
-        )
-        .await;
-    tu::assert_err(res, "Submitted validator set signatures do not have enough power");
-
-    let new_validator_set = ValidatorSet { epoch: 3, validators: vec![user1, user2], powers: vec![50, 15] };
-    let sol_new_validator_set = new_validator_set.clone().into_sol();
-    let res = chain
-        .bridge2_cid()
-        .send(
-            "updateValidatorSet",
-            (sol_new_validator_set, sol_cur_validator_set.clone(), cur_signers, signatures),
-            &eth_client,
-        )
-        .await;
-    tu::assert_err(res, "Submitted validator powers is less than minTotalValidatorPower");
-
-    let new_validator_wallets = utils::wallet_range(100);
-    let new_validators_users = new_validator_wallets.iter().map(|wallet| wallet.address().into()).collect();
-    let powers = vec![1_u64; 100];
-
-    let new_validator_set = ValidatorSet { epoch: 3, validators: new_validators_users, powers: powers.clone() };
-    let cur_validator_set = ValidatorSet { epoch: 2, validators: vec![user1, user2, user3], powers: vec![50, 25, 25] };
-    let wallets = [wallet1.clone(), wallet2.clone(), wallet3.clone()];
-    utils::update_validator_set(&eth_client, chain, &cur_validator_set, &new_validator_set, &wallets).await.unwrap();
-
-    let end_epoch = 4;
-    let cur_validator_set = new_validator_set;
-    let new_validator_set = ValidatorSet { epoch: end_epoch, validators: vec![user0], powers: vec![100] };
-    utils::update_validator_set(
-        &eth_client,
-        chain,
-        &cur_validator_set,
-        &new_validator_set,
-        new_validator_wallets.as_slice(),
-    )
-    .await
-    .unwrap();
-
-    end_epoch
-}
-
-async fn bridge2_withdrawal_tests(start_epoch: Epoch, end_epoch: Option<Epoch>) {
-    let chain = Chain::Local;
-    let eth_client = chain.eth_client(Nickname::Owner).await;
-    let signing_key = SigningKey::from_bytes(&eth_client.key().to_fixed_bytes()).unwrap();
-    let wallet0 = Wallet::from(signing_key);
-    let user0: User = wallet0.address().into();
-
-    let powers = vec![25, 1, 10, 10, 10, 6, 3, 2, 1, 88];
+    let powers = vec![55, 20, 10, 10, 6, 5, 3, 2, 1, 1];
     let wallets = utils::wallet_range(10);
     let tot_power: u64 = powers.iter().sum();
 
-    let cur_validator_set = ValidatorSet { epoch: start_epoch, validators: vec![user0], powers: vec![100] };
-    let new_epoch = start_epoch + 1;
-    let validators: Vec<_> = wallets.iter().map(|wallet| wallet.address().into()).collect();
-    let new_validator_set = ValidatorSet { epoch: new_epoch, validators: validators.clone(), powers: powers.clone() };
-    utils::update_validator_set(&eth_client, chain, &cur_validator_set, &new_validator_set, &[wallet0]).await.unwrap();
+    let active_validator_set = initial_validator_set();
+    let cur_epoch: u64 = chain.bridge2_cid().call("epoch", (), &eth_client).await.unwrap();
+    let new_epoch = cur_epoch + 1;
+    let new_validator_set: Set<_> = wallets
+        .iter()
+        .enumerate()
+        .map(|(i, wallet)| ValidatorProfile {
+            power: powers[i],
+            hot_user: wallet.address().into(),
+            cold_user: tu::user((1000 + i) as u8),
+        })
+        .collect();
 
-    let quorum_threshold = (2. * tot_power as f64) / 3.;
+    sign_and_update_validator_set(
+        &eth_client,
+        chain,
+        &active_validator_set,
+        &new_validator_set,
+        cur_epoch,
+        new_epoch,
+        &[hot_wallet],
+    )
+    .await
+    .unwrap();
+    finalize_validator_set_update(&eth_client, chain).await.unwrap();
+    let cur_epoch = new_epoch;
+
     let mut nonce = 0;
     let usd = 1.0.with_decimals(USDC_ERC20_DECIMALS);
+    let owner_eth_client = chain.eth_client(Nickname::Owner).await;
+    chain.usdc_cid().send("transfer", (hot_user.raw(), 30 * usd), &owner_eth_client).await.unwrap();
     chain.bridge2_cid().send("deposit", 30 * usd, &eth_client).await.unwrap();
 
-    let cur_validator_set = ValidatorSet { epoch: new_epoch, validators, powers: powers.clone() };
+    let active_validator_set = new_validator_set;
     for inds in [
         Vec::new(),
         vec![0],
@@ -592,47 +658,202 @@ async fn bridge2_withdrawal_tests(start_epoch: Epoch, end_epoch: Option<Epoch>) 
         let mut signatures = Vec::new();
         let mut signers = Vec::new();
         let mut sample_powers = Vec::new();
-        let hash = utils::keccak((user0.raw(), usd, nonce));
+        let hash = utils::keccak((hot_user.raw(), usd, nonce));
 
         for &i in &inds {
             let wallet = &wallets[i];
             let power = powers[i];
-            signatures.push(utils::phantom_agent(hash).sign_typed_data(chain.eth_chain(), wallet).unwrap());
+            signatures.push(chain.sign_phantom_agent(hash, wallet));
             signers.push(wallet.address().into());
             tot_sample_power += power;
             sample_powers.push(power);
         }
 
-        let quorum_reached = tot_sample_power as f64 >= quorum_threshold;
+        let quorum_reached = 3 * tot_sample_power >= 2 * tot_power;
         warn!("withdrawal fuzz test working on" => inds, quorum_reached);
 
         let withdrawal_voucher =
-            WithdrawalVoucher2 { usd, nonce, signers, cur_validator_set: cur_validator_set.clone(), signatures };
+            WithdrawalVoucher2 { usd, nonce, signers, active_validator_set: active_validator_set.clone(), signatures };
         nonce += 1;
 
-        let res = tu::bridge2_withdrawal(&chain, &eth_client, withdrawal_voucher).await;
+        let res = tu::bridge2_withdrawal(&chain, &eth_client, withdrawal_voucher, cur_epoch).await;
         assert_eq!(res.is_ok(), quorum_reached, "inds={inds:?} res={res:?}");
     }
 
     // return to state that the node integration test can use
-    let epoch = match end_epoch {
-        Some(epoch) => epoch,
-        None => InfraTime::wall_clock_now().to_unix_millis() / 1_000_000,
-    };
-    let new_validator_set = ValidatorSet { epoch, validators: vec![main_validator_user()], powers: vec![100] };
-    utils::update_validator_set(&eth_client, chain, &cur_validator_set, &new_validator_set, wallets.as_slice())
+    let new_epoch = cur_epoch + 1;
+    let new_validator_set = initial_validator_set();
+    sign_and_update_validator_set(
+        &eth_client,
+        chain,
+        &active_validator_set,
+        &new_validator_set,
+        cur_epoch,
+        new_epoch,
+        wallets.as_slice(),
+    )
+    .await
+    .unwrap();
+    finalize_validator_set_update(&eth_client, chain).await.unwrap();
+}
+
+async fn bridge2_locking_test() {
+    let chain = Chain::Local;
+
+    let eth_client = tu::main_validator_eth_client().await;
+    let hot_user = tu::main_validator_hot_user();
+    let cold_wallet = tu::main_validator_cold_wallet();
+    let cold_user = tu::main_validator_cold_user();
+
+    let cur_epoch: u64 = chain.bridge2_cid().call("epoch", (), &eth_client).await.unwrap();
+    let active_validator_set = initial_validator_set();
+
+    let sol_active_valdiator_set = SolValidatorSet::from_cold_validator_set(cur_epoch, &active_validator_set);
+    let res = chain.bridge2_cid().send("emergencyLock", (), &eth_client).await;
+    tu::assert_err(res, "Sender is not authorized to lock smart contract");
+
+    let locker = hot_user.raw();
+    let is_locker = true;
+    let nonce = U256::zero();
+    let hash = utils::keccak(("modifyLocker".to_string(), locker, is_locker, nonce));
+    let signer = cold_user.raw();
+    let signature = chain.sign_phantom_agent(hash, &cold_wallet);
+    chain
+        .bridge2_cid()
+        .send(
+            "modifyLocker",
+            (locker, is_locker, nonce, sol_active_valdiator_set.clone(), vec![signer], vec![signature]),
+            &eth_client,
+        )
+        .await
+        .unwrap();
+
+    chain.bridge2_cid().send("emergencyLock", (), &eth_client).await.unwrap();
+
+    let signer = cold_user.raw();
+    let new_dispute_period_seconds = U256::from(10);
+    let nonce = U256::zero();
+    let sol_active_cold_validator_set = SolValidatorSet::from_cold_validator_set(cur_epoch, &active_validator_set);
+    let hash = utils::keccak(("changeDisputePeriodSeconds".to_string(), new_dispute_period_seconds, nonce));
+    let signature = chain.sign_phantom_agent(hash, &cold_wallet);
+    chain
+        .bridge2_cid()
+        .send(
+            "changeDisputePeriodSeconds",
+            (new_dispute_period_seconds, nonce, sol_active_cold_validator_set.clone(), vec![signer], vec![signature]),
+            &eth_client,
+        )
+        .await
+        .unwrap();
+
+    let res: U256 = chain.bridge2_cid().call("disputePeriodSeconds", (), &eth_client).await.unwrap();
+    assert_eq!(res, new_dispute_period_seconds);
+
+    let new_block_duration_millis = U256::from(200);
+    let hash = utils::keccak(("changeblockDurationMillis".to_string(), new_block_duration_millis, nonce));
+    let signature = chain.sign_phantom_agent(hash, &cold_wallet);
+    chain
+        .bridge2_cid()
+        .send(
+            "changeBlockDurationMillis",
+            (new_block_duration_millis, nonce, sol_active_cold_validator_set.clone(), vec![signer], vec![signature]),
+            &eth_client,
+        )
+        .await
+        .unwrap();
+
+    let res: U256 = chain.bridge2_cid().call("blockDurationMillis", (), &eth_client).await.unwrap();
+    assert_eq!(res, new_block_duration_millis);
+
+    let new_epoch = cur_epoch + 1;
+    let new_validator_set = initial_validator_set();
+    let sol_new_validator_set = SolValidatorSetUpdate::from_validator_set(new_epoch, &new_validator_set);
+    let nonce = U256::zero();
+    let hash = utils::keccak((
+        "unlock".to_string(),
+        sol_new_validator_set.epoch,
+        sol_new_validator_set.clone().hot_addresses,
+        sol_new_validator_set.clone().cold_addresses,
+        sol_new_validator_set.clone().powers,
+        nonce,
+    ));
+    let signature = chain.sign_phantom_agent(hash, &cold_wallet);
+    chain
+        .bridge2_cid()
+        .send(
+            "emergencyUnlock",
+            (sol_new_validator_set, sol_active_valdiator_set, vec![signer], vec![signature], nonce),
+            &eth_client,
+        )
         .await
         .unwrap();
 }
 
-// TODO do not hardcode
-fn main_validator_user() -> User {
-    "0x7662db3a3c4243ad55b7cf230357b1a8af0e15fc".parse().unwrap()
+fn initial_validator_set() -> Set<ValidatorProfile> {
+    set![ValidatorProfile {
+        power: 1,
+        hot_user: tu::main_validator_hot_user(),
+        cold_user: tu::main_validator_cold_user(),
+    }]
 }
 
-fn main_validator() -> H256 {
-    let signing_key = utils::ed25519_signing_key("golden_inputs/priv_validator_key.json");
-    signing_key.verification_key().to_bytes().into()
+async fn setup() -> Recver<ReplicaAbciCmd> {
+    assert!(!*NODES_RUNNING.lock());
+    *NODES_RUNNING.lock() = true;
+    TendermintInit::Wipe.run(None, TendermintHome::Normal);
+    let (sender, recver) = channel();
+    let hyper_abci = HyperAbci::new(AbciStateBuilder::New { chain: Chain::Local }, sender, false, None);
+    std::thread::spawn(move || hyper_abci.run_server_blocking(TendermintHome::Normal));
+    spawn_hardhat_node().await;
+    lu::async_sleep(Duration(1.)).await;
+    recver
+}
+
+async fn setup_web_server(db_hub: Arc<DbHub>, replicator: Arc<Replicator>) {
+    let localhost = Ipv4Addr::LOCALHOST;
+    let (block_events_sender, block_events_recver) = channel();
+    let web_server_config = WebServerConfig {
+        n_nodes: Some(1),
+        node_ip: localhost,
+        internal_ip: localhost,
+        print_requests: false,
+        chain: Chain::Local,
+        db_hub,
+        replicator,
+        block_events_sender,
+        block_events_recver,
+        web_server_port: 3002,
+        should_run_solo_watcher: true,
+        db_init: DbInit::Legacy,
+        finished_seeding_explorer: Arc::new(AtomicBool::new(true)),
+    };
+    web_server_config.run().await;
+}
+
+async fn spawn_hardhat_node() {
+    std::thread::spawn(|| {
+        shell("(cd ~/cham/code/hyperliquid && npx hardhat node) > /tmp/hardhat_out 2>&1".to_string()).wait_check()
+    });
+    lu::async_sleep(Duration(1.)).await;
+    shell("(cd ~/cham/code/hyperliquid && npx hardhat run deploy/contracts.js --network localhost) > /tmp/hardhat_deploy_out 2>&1".to_string()).wait_check();
+}
+
+fn account_value(replicator: &Replicator, user: User) -> f64 {
+    replicator
+        .lock(|e| e.web_data(Some(user)), "integration_test_account_value")
+        .user_state
+        .margin_summary
+        .account_value
+        .0
+}
+
+async fn claim_withdrawal_on_bridge(
+    chain: Chain,
+    withdrawal_voucher: WithdrawalVoucher,
+    client: &EthClient,
+) -> infra::Result<Receipt> {
+    let WithdrawalVoucher { signature, action: WithdrawAction { usd, nonce }, .. } = withdrawal_voucher;
+    chain.bridge_cid().send("withdraw", (signature, usd, nonce), client).await
 }
 
 lazy_static! {
