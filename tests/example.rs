@@ -702,31 +702,54 @@ async fn bridge2_locking_test() {
 
     let eth_client = tu::main_validator_eth_client().await;
     let hot_user = tu::main_validator_hot_user();
+    let hot_wallet = tu::main_validator_hot_wallet();
     let cold_wallet = tu::main_validator_cold_wallet();
     let cold_user = tu::main_validator_cold_user();
 
     let cur_epoch: u64 = chain.bridge2_cid().call("epoch", (), &eth_client).await.unwrap();
     let active_validator_set = initial_validator_set();
 
-    let sol_active_valdiator_set = SolValidatorSet::from_cold_validator_set(cur_epoch, &active_validator_set);
-    let res = chain.bridge2_cid().send("emergencyLock", (), &eth_client).await;
+    let sol_active_hot_valdiator_set = SolValidatorSet::from_hot_validator_set(cur_epoch, &active_validator_set);
+    let unauthorized_locker = chain.eth_client(Nickname::User).await;
+    let res = chain.bridge2_cid().send("emergencyLock", (), &unauthorized_locker).await;
     tu::assert_err(res, "Sender is not authorized to lock smart contract");
 
     let locker = hot_user.raw();
     let is_locker = true;
     let nonce = U256::zero();
     let hash = utils::keccak(("modifyLocker".to_string(), locker, is_locker, nonce));
-    let signer = cold_user.raw();
-    let signature = chain.sign_phantom_agent(hash, &cold_wallet);
+    let signer = hot_user.raw();
+    let signature = chain.sign_phantom_agent(hash, &hot_wallet);
     chain
         .bridge2_cid()
         .send(
             "modifyLocker",
-            (locker, is_locker, nonce, sol_active_valdiator_set.clone(), vec![signer], vec![signature]),
+            (locker, is_locker, nonce, sol_active_hot_valdiator_set.clone(), vec![signer], vec![signature]),
             &eth_client,
         )
         .await
         .unwrap();
+    let res: bool = chain.bridge2_cid().call("isLocker", locker, &eth_client).await.unwrap();
+    assert_eq!(res, is_locker);
+
+    let user1 = tu::user(1);
+    let finalizer = user1.raw();
+    let is_finalizer = true;
+    let nonce = U256::zero();
+    let hash = utils::keccak(("modifyFinalizer".to_string(), finalizer, is_finalizer, nonce));
+    let signer = hot_user.raw();
+    let signature = chain.sign_phantom_agent(hash, &hot_wallet);
+    chain
+        .bridge2_cid()
+        .send(
+            "modifyFinalizer",
+            (finalizer, is_finalizer, nonce, sol_active_hot_valdiator_set.clone(), vec![signer], vec![signature]),
+            &eth_client,
+        )
+        .await
+        .unwrap();
+    let res: bool = chain.bridge2_cid().call("isFinalizer", finalizer, &eth_client).await.unwrap();
+    assert_eq!(res, is_finalizer);
 
     chain.bridge2_cid().send("emergencyLock", (), &eth_client).await.unwrap();
 
@@ -782,11 +805,50 @@ async fn bridge2_locking_test() {
         .bridge2_cid()
         .send(
             "emergencyUnlock",
-            (sol_new_validator_set, sol_active_valdiator_set, vec![signer], vec![signature], nonce),
+            (sol_new_validator_set, sol_active_cold_validator_set, vec![signer], vec![signature], nonce),
             &eth_client,
         )
         .await
         .unwrap();
+
+    let cur_epoch = new_epoch;
+    let active_validator_set = new_validator_set;
+    let sol_active_cold_valdiator_set = SolValidatorSet::from_cold_validator_set(cur_epoch, &active_validator_set);
+    let locker = hot_user.raw();
+    let is_locker = false;
+    let nonce = U256::one();
+    let hash = utils::keccak(("modifyLocker".to_string(), locker, is_locker, nonce));
+    let signer = cold_user.raw();
+    let signature = chain.sign_phantom_agent(hash, &cold_wallet);
+    chain
+        .bridge2_cid()
+        .send(
+            "modifyLocker",
+            (locker, is_locker, nonce, sol_active_cold_valdiator_set.clone(), vec![signer], vec![signature]),
+            &eth_client,
+        )
+        .await
+        .unwrap();
+    let res: bool = chain.bridge2_cid().call("isLocker", locker, &eth_client).await.unwrap();
+    assert_eq!(res, is_locker);
+
+    let finalizer = user1.raw();
+    let is_finalizer = false;
+    let nonce = U256::one();
+    let hash = utils::keccak(("modifyFinalizer".to_string(), finalizer, is_finalizer, nonce));
+    let signer = cold_user.raw();
+    let signature = chain.sign_phantom_agent(hash, &cold_wallet);
+    chain
+        .bridge2_cid()
+        .send(
+            "modifyFinalizer",
+            (finalizer, is_finalizer, nonce, sol_active_cold_valdiator_set, vec![signer], vec![signature]),
+            &eth_client,
+        )
+        .await
+        .unwrap();
+    let res: bool = chain.bridge2_cid().call("isFinalizer", finalizer, &eth_client).await.unwrap();
+    assert_eq!(res, is_finalizer);
 }
 
 fn initial_validator_set() -> Set<ValidatorProfile> {

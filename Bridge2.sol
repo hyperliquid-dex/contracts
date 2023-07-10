@@ -40,6 +40,16 @@
       These addresses are approved by the validators to lock the contract if submitted signatures do not match
       the locker's view of the L1. Once locked, only a quorum of cold wallet validator signatures can unlock the bridge.
       This dispute period is used for both withdrawals and validator set updates.
+      L1 operation will automatically register all validator hot addresses as lockers.
+      Adding a locker requires hot wallet quorum, and removing requires cold wallet quorum.
+
+    Finalizers:
+      These addresses are approved by the validators to finalize withdrawals and validator set updates.
+      While not strictly necessary due to the locking mechanism, this adds an additional layer of security without sacrificing functionality.
+      Even if locking transactions are censored (which should be economically infeasible), this still requires attackers to control a finalizer private key.
+      L1 operation will eventually register all validator hot addresses as finalizers,
+      though there may be an intermediate phase where finalizers are a subset of trusted validators.
+      Adding a finalizer requires hot wallet quorum, and removing requires cold wallet quorum.
 
     Unlocking:
       When the bridge is unlocked, a new validator set is atomically set and finalized.
@@ -136,6 +146,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
 
   mapping(bytes32 => bool) usedMessages;
   mapping(address => bool) lockers;
+  mapping(address => bool) finalizers;
 
   uint64 public epoch;
   uint64 public totalValidatorPower;
@@ -158,6 +169,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   event RequestedValidatorSetUpdate(RequestedValidatorSetUpdateEvent e);
   event FinalizedValidatorSetUpdate(FinalizedValidatorSetUpdateEvent e);
   event ModifiedLocker(address indexed locker, bool isLocker);
+  event ModifiedFinalizer(address indexed finalzier, bool isFinalizer);
   event ChangedDisputePeriodSeconds(uint64 newDisputePeriodSeconds);
   event ChangedBlockDurationMillis(uint64 newBlockDurationMillis);
 
@@ -193,6 +205,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     usdcToken = ERC20(usdcAddress);
     disputePeriodSeconds = _disputePeriodSeconds;
     blockDurationMillis = _blockDurationMillis;
+    addLockersAndFinalizers(hotAddresses);
 
     emit RequestedValidatorSetUpdate(
       RequestedValidatorSetUpdateEvent({
@@ -220,6 +233,15 @@ contract Bridge2 is Pausable, ReentrancyGuard {
         coldValidatorSetHash: coldValidatorSetHash
       })
     );
+  }
+
+  function addLockersAndFinalizers(address[] memory addresses) private {
+    uint64 end = uint64(addresses.length);
+    for (uint64 idx; idx < end; idx++) {
+      address _address = addresses[idx];
+      lockers[_address] = true;
+      finalizers[_address] = true;
+    }
   }
 
   // A utility function to make a checkpoint of the validator set supplied.
@@ -282,6 +304,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   }
 
   function finalizeWithdrawal(bytes32 message) private nonReentrant whenNotPaused {
+    checkFinalizer(msg.sender);
     require(!finalizedWithdrawals[message], "Withdrawal already finalized");
     Withdrawal memory withdrawal = requestedWithdrawals[message];
 
@@ -476,14 +499,18 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   }
 
   function finalizeValidatorSetUpdate() external nonReentrant whenNotPaused {
+    checkFinalizer(msg.sender);
+
     require(
       pendingValidatorSetUpdate.updateTime != 0,
       "Pending validator set update already finalized"
     );
+
     checkDisputePeriod(
       pendingValidatorSetUpdate.updateTime,
       pendingValidatorSetUpdate.updateBlockNumber
     );
+
     finalizeValidatorSetUpdateInner();
   }
 
@@ -506,25 +533,68 @@ contract Bridge2 is Pausable, ReentrancyGuard {
 
   function modifyLocker(
     address locker,
-    bool isLocker,
+    bool _isLocker,
     uint64 nonce,
-    ValidatorSet calldata activeColdValidatorSet,
+    ValidatorSet calldata activeValidatorSet,
     address[] calldata signers,
     Signature[] memory signatures
   ) external {
-    Agent memory agent = Agent("a", keccak256(abi.encode("modifyLocker", locker, isLocker, nonce)));
+    Agent memory agent = Agent(
+      "a",
+      keccak256(abi.encode("modifyLocker", locker, _isLocker, nonce))
+    );
     bytes32 message = hash(agent);
 
+    bytes32 validatorSetHash;
+    if (_isLocker) {
+      validatorSetHash = hotValidatorSetHash;
+    } else {
+      validatorSetHash = coldValidatorSetHash;
+    }
+
     checkMessageNotUsed(message);
-    checkValidatorSignatures(
-      message,
-      activeColdValidatorSet,
-      signers,
-      signatures,
-      coldValidatorSetHash
+    checkValidatorSignatures(message, activeValidatorSet, signers, signatures, validatorSetHash);
+    lockers[locker] = _isLocker;
+    emit ModifiedLocker(locker, _isLocker);
+  }
+
+  function isLocker(address locker) external view returns (bool) {
+    return lockers[locker];
+  }
+
+  function modifyFinalizer(
+    address finalizer,
+    bool _isFinalizer,
+    uint64 nonce,
+    ValidatorSet calldata activeValidatorSet,
+    address[] calldata signers,
+    Signature[] memory signatures
+  ) external {
+    Agent memory agent = Agent(
+      "a",
+      keccak256(abi.encode("modifyFinalizer", finalizer, _isFinalizer, nonce))
     );
-    lockers[locker] = isLocker;
-    emit ModifiedLocker(locker, isLocker);
+    bytes32 message = hash(agent);
+
+    bytes32 validatorSetHash;
+    if (_isFinalizer) {
+      validatorSetHash = hotValidatorSetHash;
+    } else {
+      validatorSetHash = coldValidatorSetHash;
+    }
+
+    checkMessageNotUsed(message);
+    checkValidatorSignatures(message, activeValidatorSet, signers, signatures, validatorSetHash);
+    finalizers[finalizer] = _isFinalizer;
+    emit ModifiedFinalizer(finalizer, _isFinalizer);
+  }
+
+  function isFinalizer(address finalizer) external view returns (bool) {
+    return finalizers[finalizer];
+  }
+
+  function checkFinalizer(address finalizer) private view {
+    require(finalizers[finalizer], "Sender is not a finalizer");
   }
 
   // This function checks that the total power of the new validator set is greater than zero.
