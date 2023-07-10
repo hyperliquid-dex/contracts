@@ -7,8 +7,7 @@
 // Replicator, HyperAbci, *Action, and other unexplained things relate to the L1,
 // so please take those as black boxes that work.
 //
-// The most relevant tests that isolate the bridge being audited are
-// bridge2_withdrawal_tests and bridge2_update_validator_tests
+// The most relevant tests that isolate the bridge being audited are the bridge2_* tests.
 //
 // Note that bridge_watcher2 is a task that polls for events emitted by Bridge2 and sends the
 // required validator set update and finalization transactions. See Bridge2.sol for details.
