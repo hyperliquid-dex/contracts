@@ -10,7 +10,8 @@
 // The most relevant tests that isolate the bridge being audited are the bridge2_* tests.
 //
 // Note that bridge_watcher2 is a task that polls for events emitted by Bridge2 and sends the
-// required validator set update and finalization transactions. See Bridge2.sol for details.
+// required validator set update and finalization transactions.
+// See Bridge2.sol and tests/bridge_watcher2.rs for details.
 
 use crate::prelude::*;
 use crate::{
