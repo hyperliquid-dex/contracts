@@ -70,6 +70,7 @@ pragma solidity ^0.8.9;
 import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./Signature.sol";
 
 struct ValidatorSet {
@@ -138,6 +139,7 @@ struct FinalizedValidatorSetUpdateEvent {
 }
 
 contract Bridge2 is Pausable, ReentrancyGuard {
+  using SafeERC20 for ERC20;
   ERC20 usdcToken;
 
   bytes32 public hotValidatorSetHash;
@@ -263,8 +265,8 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   // A deposit event will be emitted crediting the L1 with the usdc.
   function deposit(uint64 usdc) external whenNotPaused nonReentrant {
     address user = msg.sender;
+    usdcToken.safeTransferFrom(user, address(this), usdc);
     emit Deposit(DepositEvent({ user: user, usdc: usdc }));
-    usdcToken.transferFrom(user, address(this), usdc);
   }
 
   // An external function anyone can call to withdraw usdc from the bridge by providing valid signatures
@@ -320,7 +322,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     checkDisputePeriod(withdrawal.requestedTime, withdrawal.requestedBlockNumber);
 
     finalizedWithdrawals[message] = true;
-    usdcToken.transfer(withdrawal.user, withdrawal.usdc);
+    usdcToken.safeTransfer(withdrawal.user, withdrawal.usdc);
     emit FinalizedWithdrawal(
       FinalizedWithdrawalEvent({
         user: withdrawal.user,
