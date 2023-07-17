@@ -312,6 +312,10 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     require(!finalizedWithdrawals[message], "Withdrawal already finalized");
 
     Withdrawal memory withdrawal = requestedWithdrawals[message];
+    require(
+      withdrawal.user != address(0),
+      "Withdrawal message does not correspond to an existing withdrawal request"
+    );
 
     checkDisputePeriod(withdrawal.requestedTime, withdrawal.requestedBlockNumber);
 
