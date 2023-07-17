@@ -147,7 +147,6 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   mapping(bytes32 => bool) usedMessages;
   mapping(address => bool) lockers;
   mapping(address => bool) finalizers;
-
   uint64 public epoch;
   uint64 public totalValidatorPower;
   uint64 public disputePeriodSeconds;
@@ -159,6 +158,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
 
   mapping(bytes32 => Withdrawal) requestedWithdrawals;
   mapping(bytes32 => bool) finalizedWithdrawals;
+  mapping(bytes32 => bool) withdrawalsInvalidated;
 
   bytes32 immutable domainSeparator;
 
@@ -172,6 +172,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   event ModifiedFinalizer(address indexed finalizer, bool isFinalizer);
   event ChangedDisputePeriodSeconds(uint64 newDisputePeriodSeconds);
   event ChangedBlockDurationMillis(uint64 newBlockDurationMillis);
+  event InvalidatedWithdrawals(bytes32[] withdrawalsInvalidated);
 
   // We could have the deployer initialize separately so that all function args in this file can be calldata.
   // However, calldata does not seem cheaper than memory on Arbitrum, so not a big deal for now.
@@ -279,6 +280,8 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     // For now we do not care about the overhead with EIP-712 because Arbitrum gas is cheap.
     Agent memory agent = Agent("a", keccak256(abi.encode(msg.sender, usdc, nonce)));
     bytes32 message = hash(agent);
+    checkValidWithdrawal(message);
+
     Withdrawal memory withdrawal = Withdrawal({
       user: msg.sender,
       usdc: usdc,
@@ -304,7 +307,10 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   }
 
   function finalizeWithdrawal(bytes32 message) private whenNotPaused {
+    checkValidWithdrawal(message);
+
     require(!finalizedWithdrawals[message], "Withdrawal already finalized");
+
     Withdrawal memory withdrawal = requestedWithdrawals[message];
 
     checkDisputePeriod(withdrawal.requestedTime, withdrawal.requestedBlockNumber);
@@ -330,6 +336,10 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     for (uint64 idx; idx < end; idx++) {
       finalizeWithdrawal(messages[idx]);
     }
+  }
+
+  function checkValidWithdrawal(bytes32 message) private view {
+    require(!withdrawalsInvalidated[message], "Withdrawal has been invalidated.");
   }
 
   function checkDisputePeriod(uint64 time, uint64 blockNumber) private view {
@@ -406,21 +416,6 @@ contract Bridge2 is Pausable, ReentrancyGuard {
       "Supplied active validators and powers do not match checkpoint"
     );
 
-    require(
-      newValidatorSet.hotAddresses.length == newValidatorSet.coldAddresses.length,
-      "New hot and cold validator sets length mismatch"
-    );
-
-    require(
-      newValidatorSet.hotAddresses.length == newValidatorSet.powers.length,
-      "New validator set and powers length mismatch"
-    );
-
-    require(
-      newValidatorSet.epoch > activeHotValidatorSet.epoch,
-      "New validator set epoch must be greater than the active epoch"
-    );
-
     Agent memory agent = Agent(
       "a",
       keccak256(
@@ -451,6 +446,21 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     bytes32 message,
     bool useColdValidatorSet
   ) private {
+    require(
+      newValidatorSet.hotAddresses.length == newValidatorSet.coldAddresses.length,
+      "New hot and cold validator sets length mismatch"
+    );
+
+    require(
+      newValidatorSet.hotAddresses.length == newValidatorSet.powers.length,
+      "New validator set and powers length mismatch"
+    );
+
+    require(
+      newValidatorSet.epoch > activeValidatorSet.epoch,
+      "New validator set epoch must be greater than the active epoch"
+    );
+
     uint64 newTotalValidatorPower = checkNewValidatorPowers(newValidatorSet.powers);
 
     bytes32 validatorSetHash;
@@ -632,6 +642,35 @@ contract Bridge2 is Pausable, ReentrancyGuard {
 
     disputePeriodSeconds = newDisputePeriodSeconds;
     emit ChangedDisputePeriodSeconds(newDisputePeriodSeconds);
+  }
+
+  function invalidateWithdrawals(
+    bytes32[] memory messages,
+    uint64 nonce,
+    ValidatorSet memory activeColdValidatorSet,
+    address[] memory signers,
+    Signature[] memory signatures
+  ) external whenPaused {
+    Agent memory agent = Agent(
+      "a",
+      keccak256(abi.encode("invalidateWithdrawals", messages, nonce))
+    );
+    bytes32 message = hash(agent);
+    checkMessageNotUsed(message);
+    checkValidatorSignatures(
+      message,
+      activeColdValidatorSet,
+      signers,
+      signatures,
+      coldValidatorSetHash
+    );
+
+    uint64 end = uint64(messages.length);
+    for (uint64 idx; idx < end; idx++) {
+      withdrawalsInvalidated[messages[idx]] = true;
+    }
+
+    emit InvalidatedWithdrawals(messages);
   }
 
   function changeBlockDurationMillis(
