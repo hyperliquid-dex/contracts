@@ -280,7 +280,10 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   ) external nonReentrant whenNotPaused {
     // NOTE: this is a temporary workaround because EIP-191 signatures do not match between rust client and solidity.
     // For now we do not care about the overhead with EIP-712 because Arbitrum gas is cheap.
-    Agent memory agent = Agent("a", keccak256(abi.encode(msg.sender, usdc, nonce)));
+    Agent memory agent = Agent(
+      "a",
+      keccak256(abi.encode("requestWithdrawal", msg.sender, usdc, nonce))
+    );
     bytes32 message = hash(agent);
     checkValidWithdrawal(message);
 
@@ -426,6 +429,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
       "a",
       keccak256(
         abi.encode(
+          "updateValidatorSet",
           newValidatorSet.epoch,
           newValidatorSet.hotAddresses,
           newValidatorSet.coldAddresses,
