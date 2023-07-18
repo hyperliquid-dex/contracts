@@ -280,11 +280,9 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   ) external nonReentrant whenNotPaused {
     // NOTE: this is a temporary workaround because EIP-191 signatures do not match between rust client and solidity.
     // For now we do not care about the overhead with EIP-712 because Arbitrum gas is cheap.
-    Agent memory agent = Agent(
-      "a",
-      keccak256(abi.encode("requestWithdrawal", msg.sender, usdc, nonce))
-    );
-    bytes32 message = hash(agent);
+
+    bytes32 data = keccak256(abi.encode("requestWithdrawal", msg.sender, usdc, nonce));
+    bytes32 message = makeMessage(data);
     checkValidWithdrawal(message);
 
     Withdrawal memory withdrawal = Withdrawal({
@@ -425,19 +423,17 @@ contract Bridge2 is Pausable, ReentrancyGuard {
       "Supplied active validators and powers do not match checkpoint"
     );
 
-    Agent memory agent = Agent(
-      "a",
-      keccak256(
-        abi.encode(
-          "updateValidatorSet",
-          newValidatorSet.epoch,
-          newValidatorSet.hotAddresses,
-          newValidatorSet.coldAddresses,
-          newValidatorSet.powers
-        )
+    bytes32 data = keccak256(
+      abi.encode(
+        "updateValidatorSet",
+        newValidatorSet.epoch,
+        newValidatorSet.hotAddresses,
+        newValidatorSet.coldAddresses,
+        newValidatorSet.powers
       )
     );
-    bytes32 message = hash(agent);
+    bytes32 message = makeMessage(data);
+
     updateValidatorSetInner(
       newValidatorSet,
       activeHotValidatorSet,
@@ -552,6 +548,11 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     );
   }
 
+  function makeMessage(bytes32 data) private view returns (bytes32) {
+    Agent memory agent = Agent("a", keccak256(abi.encode(address(this), data)));
+    return hash(agent);
+  }
+
   function modifyLocker(
     address locker,
     bool _isLocker,
@@ -560,11 +561,8 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     address[] calldata signers,
     Signature[] memory signatures
   ) external {
-    Agent memory agent = Agent(
-      "a",
-      keccak256(abi.encode("modifyLocker", locker, _isLocker, nonce))
-    );
-    bytes32 message = hash(agent);
+    bytes32 data = keccak256(abi.encode("modifyLocker", locker, _isLocker, nonce));
+    bytes32 message = makeMessage(data);
 
     bytes32 validatorSetHash;
     if (_isLocker) {
@@ -591,11 +589,8 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     address[] calldata signers,
     Signature[] memory signatures
   ) external {
-    Agent memory agent = Agent(
-      "a",
-      keccak256(abi.encode("modifyFinalizer", finalizer, _isFinalizer, nonce))
-    );
-    bytes32 message = hash(agent);
+    bytes32 data = keccak256(abi.encode("modifyFinalizer", finalizer, _isFinalizer, nonce));
+    bytes32 message = makeMessage(data);
 
     bytes32 validatorSetHash;
     if (_isFinalizer) {
@@ -636,11 +631,10 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     address[] memory signers,
     Signature[] memory signatures
   ) external whenPaused {
-    Agent memory agent = Agent(
-      "a",
-      keccak256(abi.encode("changeDisputePeriodSeconds", newDisputePeriodSeconds, nonce))
+    bytes32 data = keccak256(
+      abi.encode("changeDisputePeriodSeconds", newDisputePeriodSeconds, nonce)
     );
-    bytes32 message = hash(agent);
+    bytes32 message = makeMessage(data);
     checkMessageNotUsed(message);
     checkValidatorSignatures(
       message,
@@ -661,11 +655,9 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     address[] memory signers,
     Signature[] memory signatures
   ) external whenPaused {
-    Agent memory agent = Agent(
-      "a",
-      keccak256(abi.encode("invalidateWithdrawals", messages, nonce))
-    );
-    bytes32 message = hash(agent);
+    bytes32 data = keccak256(abi.encode("invalidateWithdrawals", messages, nonce));
+    bytes32 message = makeMessage(data);
+
     checkMessageNotUsed(message);
     checkValidatorSignatures(
       message,
@@ -690,11 +682,11 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     address[] memory signers,
     Signature[] memory signatures
   ) external whenPaused {
-    Agent memory agent = Agent(
-      "a",
-      keccak256(abi.encode("changeBlockDurationMillis", newBlockDurationMillis, nonce))
+    bytes32 data = keccak256(
+      abi.encode("changeBlockDurationMillis", newBlockDurationMillis, nonce)
     );
-    bytes32 message = hash(agent);
+    bytes32 message = makeMessage(data);
+
     checkMessageNotUsed(message);
     checkValidatorSignatures(
       message,
@@ -720,20 +712,18 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     Signature[] calldata signatures,
     uint64 nonce
   ) external {
-    Agent memory agent = Agent(
-      "a",
-      keccak256(
-        abi.encode(
-          "unlock",
-          newValidatorSet.epoch,
-          newValidatorSet.hotAddresses,
-          newValidatorSet.coldAddresses,
-          newValidatorSet.powers,
-          nonce
-        )
+    bytes32 data = keccak256(
+      abi.encode(
+        "unlock",
+        newValidatorSet.epoch,
+        newValidatorSet.hotAddresses,
+        newValidatorSet.coldAddresses,
+        newValidatorSet.powers,
+        nonce
       )
     );
-    bytes32 message = hash(agent);
+    bytes32 message = makeMessage(data);
+
     checkMessageNotUsed(message);
     updateValidatorSetInner(
       newValidatorSet,
