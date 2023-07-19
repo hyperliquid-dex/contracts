@@ -275,7 +275,6 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     uint64 usdc,
     uint64 nonce,
     ValidatorSet calldata hotValidatorSet,
-    address[] calldata signers,
     Signature[] calldata signatures
   ) external nonReentrant whenNotPaused {
     // NOTE: this is a temporary workaround because EIP-191 signatures do not match between rust client and solidity.
@@ -295,7 +294,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     });
 
     require(requestedWithdrawals[message].requestedTime == 0, "Withdrawal already requested");
-    checkValidatorSignatures(message, hotValidatorSet, signers, signatures, hotValidatorSetHash);
+    checkValidatorSignatures(message, hotValidatorSet, signatures, hotValidatorSetHash);
 
     requestedWithdrawals[message] = withdrawal;
     emit RequestedWithdrawal(
@@ -361,7 +360,6 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   function checkValidatorSignatures(
     bytes32 message,
     ValidatorSet memory activeValidatorSet, // Active set of all L1 validators
-    address[] memory signers, // Subsequence of the active L1 validators that signed the message
     Signature[] memory signatures,
     bytes32 validatorSetHash
   ) private view {
@@ -370,30 +368,25 @@ contract Bridge2 is Pausable, ReentrancyGuard {
       "Supplied active validators and powers do not match the active checkpoint"
     );
 
-    uint64 nSigners = uint64(signers.length);
-    require(nSigners > 0, "Signers empty");
-    require(nSigners == signatures.length, "Signatures and signers have different lengths");
+    uint64 nSignatures = uint64(signatures.length);
+    require(nSignatures > 0, "Signers empty");
 
     uint64 cumulativePower;
-    uint64 signerIdx;
+    uint64 signatureIdx;
     uint64 end = uint64(activeValidatorSet.validators.length);
 
     for (uint64 activeValidatorSetIdx; activeValidatorSetIdx < end; activeValidatorSetIdx++) {
-      address signer = signers[signerIdx];
+      address signer = recoverSigner(message, signatures[signatureIdx], domainSeparator);
       if (signer == activeValidatorSet.validators[activeValidatorSetIdx]) {
         uint64 power = activeValidatorSet.powers[activeValidatorSetIdx];
-        require(
-          recoverSigner(message, signatures[signerIdx], domainSeparator) == signer,
-          "Validator signature does not match"
-        );
         cumulativePower += power;
 
         if (3 * cumulativePower >= 2 * totalValidatorPower) {
           break;
         }
 
-        signerIdx += 1;
-        if (signerIdx >= nSigners) {
+        signatureIdx += 1;
+        if (signatureIdx >= nSignatures) {
           break;
         }
       }
@@ -415,7 +408,6 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   function updateValidatorSet(
     ValidatorSetUpdateRequest memory newValidatorSet,
     ValidatorSet memory activeHotValidatorSet,
-    address[] memory signers,
     Signature[] memory signatures
   ) external whenNotPaused {
     require(
@@ -434,20 +426,12 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     );
     bytes32 message = makeMessage(data);
 
-    updateValidatorSetInner(
-      newValidatorSet,
-      activeHotValidatorSet,
-      signers,
-      signatures,
-      message,
-      false
-    );
+    updateValidatorSetInner(newValidatorSet, activeHotValidatorSet, signatures, message, false);
   }
 
   function updateValidatorSetInner(
     ValidatorSetUpdateRequest memory newValidatorSet,
     ValidatorSet memory activeValidatorSet,
-    address[] memory signers,
     Signature[] memory signatures,
     bytes32 message,
     bool useColdValidatorSet
@@ -476,7 +460,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
       validatorSetHash = hotValidatorSetHash;
     }
 
-    checkValidatorSignatures(message, activeValidatorSet, signers, signatures, validatorSetHash);
+    checkValidatorSignatures(message, activeValidatorSet, signatures, validatorSetHash);
 
     ValidatorSet memory newHotValidatorSet;
     newHotValidatorSet = ValidatorSet({
@@ -558,7 +542,6 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     bool _isLocker,
     uint64 nonce,
     ValidatorSet calldata activeValidatorSet,
-    address[] calldata signers,
     Signature[] memory signatures
   ) external {
     bytes32 data = keccak256(abi.encode("modifyLocker", locker, _isLocker, nonce));
@@ -572,7 +555,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     }
 
     checkMessageNotUsed(message);
-    checkValidatorSignatures(message, activeValidatorSet, signers, signatures, validatorSetHash);
+    checkValidatorSignatures(message, activeValidatorSet, signatures, validatorSetHash);
     lockers[locker] = _isLocker;
     emit ModifiedLocker(locker, _isLocker);
   }
@@ -586,7 +569,6 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     bool _isFinalizer,
     uint64 nonce,
     ValidatorSet calldata activeValidatorSet,
-    address[] calldata signers,
     Signature[] memory signatures
   ) external {
     bytes32 data = keccak256(abi.encode("modifyFinalizer", finalizer, _isFinalizer, nonce));
@@ -600,7 +582,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     }
 
     checkMessageNotUsed(message);
-    checkValidatorSignatures(message, activeValidatorSet, signers, signatures, validatorSetHash);
+    checkValidatorSignatures(message, activeValidatorSet, signatures, validatorSetHash);
     finalizers[finalizer] = _isFinalizer;
     emit ModifiedFinalizer(finalizer, _isFinalizer);
   }
@@ -628,7 +610,6 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     uint64 newDisputePeriodSeconds,
     uint64 nonce,
     ValidatorSet memory activeColdValidatorSet,
-    address[] memory signers,
     Signature[] memory signatures
   ) external whenPaused {
     bytes32 data = keccak256(
@@ -636,13 +617,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     );
     bytes32 message = makeMessage(data);
     checkMessageNotUsed(message);
-    checkValidatorSignatures(
-      message,
-      activeColdValidatorSet,
-      signers,
-      signatures,
-      coldValidatorSetHash
-    );
+    checkValidatorSignatures(message, activeColdValidatorSet, signatures, coldValidatorSetHash);
 
     disputePeriodSeconds = newDisputePeriodSeconds;
     emit ChangedDisputePeriodSeconds(newDisputePeriodSeconds);
@@ -652,20 +627,13 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     bytes32[] memory messages,
     uint64 nonce,
     ValidatorSet memory activeColdValidatorSet,
-    address[] memory signers,
     Signature[] memory signatures
   ) external whenPaused {
     bytes32 data = keccak256(abi.encode("invalidateWithdrawals", messages, nonce));
     bytes32 message = makeMessage(data);
 
     checkMessageNotUsed(message);
-    checkValidatorSignatures(
-      message,
-      activeColdValidatorSet,
-      signers,
-      signatures,
-      coldValidatorSetHash
-    );
+    checkValidatorSignatures(message, activeColdValidatorSet, signatures, coldValidatorSetHash);
 
     uint64 end = uint64(messages.length);
     for (uint64 idx; idx < end; idx++) {
@@ -679,7 +647,6 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     uint64 newBlockDurationMillis,
     uint64 nonce,
     ValidatorSet memory activeColdValidatorSet,
-    address[] memory signers,
     Signature[] memory signatures
   ) external whenPaused {
     bytes32 data = keccak256(
@@ -688,13 +655,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     bytes32 message = makeMessage(data);
 
     checkMessageNotUsed(message);
-    checkValidatorSignatures(
-      message,
-      activeColdValidatorSet,
-      signers,
-      signatures,
-      coldValidatorSetHash
-    );
+    checkValidatorSignatures(message, activeColdValidatorSet, signatures, coldValidatorSetHash);
 
     blockDurationMillis = newBlockDurationMillis;
     emit ChangedBlockDurationMillis(newBlockDurationMillis);
@@ -708,7 +669,6 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   function emergencyUnlock(
     ValidatorSetUpdateRequest memory newValidatorSet,
     ValidatorSet calldata activeColdValidatorSet,
-    address[] calldata signers,
     Signature[] calldata signatures,
     uint64 nonce
   ) external {
@@ -725,14 +685,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     bytes32 message = makeMessage(data);
 
     checkMessageNotUsed(message);
-    updateValidatorSetInner(
-      newValidatorSet,
-      activeColdValidatorSet,
-      signers,
-      signatures,
-      message,
-      true
-    );
+    updateValidatorSetInner(newValidatorSet, activeColdValidatorSet, signatures, message, true);
     finalizeValidatorSetUpdateInner();
     _unpause();
   }
