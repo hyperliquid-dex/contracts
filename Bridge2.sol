@@ -140,7 +140,7 @@ struct FinalizedValidatorSetUpdateEvent {
 
 contract Bridge2 is Pausable, ReentrancyGuard {
   using SafeERC20 for ERC20;
-  ERC20 usdcToken;
+  ERC20 public usdcToken;
 
   bytes32 public hotValidatorSetHash;
   bytes32 public coldValidatorSetHash;
@@ -156,6 +156,8 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   uint64 public blockDurationMillis;
 
   // Expose this for convenience because we only store the hash.
+  // The uniqueness of the validators is enforced on the L1 side.
+  // However, no functionality breaks even if addresses are repeated.
   uint64 public nValidators;
 
   mapping(bytes32 => Withdrawal) requestedWithdrawals;
