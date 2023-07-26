@@ -34,6 +34,7 @@ use crate::{
 use ethers::prelude::k256::ecdsa::SigningKey;
 use infra::{set, shell};
 use std::sync::atomic::AtomicBool;
+use ethers::abi::Tokenizable;
 
 #[tokio::test]
 async fn integration_tests() {
@@ -82,6 +83,7 @@ async fn integration_tests() {
     bridge2_update_validator_tests().await;
     bridge2_withdrawal_tests().await;
     bridge2_locking_test().await;
+    bridge2_batched_finalize_withdrawals_unit_tests().await;
 }
 
 async fn bridge2_end_to_end_test(http_client: &Arc<HttpClient>, replicator: &Arc<Replicator>) {
@@ -851,6 +853,157 @@ async fn bridge2_locking_test() {
     assert_eq!(res, is_finalizer);
 }
 
+async fn bridge2_batched_finalize_withdrawals_unit_tests() {
+    let chain = Chain::Local;
+    let eth_client = tu::main_validator_eth_client().await;
+    let hot_user = tu::main_validator_hot_user();
+    let hot_wallet = tu::main_validator_hot_wallet();
+    let cold_wallet = tu::main_validator_cold_wallet();
+    let cur_epoch: u64 = chain.bridge2_cid().call("epoch", (), &eth_client).await.unwrap();
+    let active_validator_set = initial_validator_set();
+
+    let usd = 10.0.with_decimals(USDC_ERC20_DECIMALS);
+    // Approve usdc and initialize bridge with sufficient funds
+    let owner_eth_client = chain.eth_client(Nickname::Owner).await;
+    chain
+        .usdc_cid()
+        .send("approve", (chain.bridge2_cid().address(chain.eth_chain()), u64::MAX), &owner_eth_client)
+        .await
+        .unwrap();
+    chain
+        .usdc_cid()
+        .send("approve", (chain.bridge2_cid().address(chain.eth_chain()), u64::MAX), &eth_client)
+        .await
+        .unwrap();
+    let initial_bridge_bal: U256 =
+        chain.usdc_cid().call("balanceOf", chain.bridge2_cid().address(chain.eth_chain()), &eth_client).await.unwrap();
+    let initial_user_bal: U256 = chain.usdc_cid().call("balanceOf", hot_user.to_address(), &eth_client).await.unwrap();
+    let to_transfer = 30 * usd - initial_bridge_bal.as_u64();
+    let to_mint = to_transfer - initial_user_bal.as_u64();
+    chain.usdc_cid().send("mint", to_mint, &owner_eth_client).await.unwrap();
+    chain.usdc_cid().send("transfer", (hot_user.raw(), to_mint), &owner_eth_client).await.unwrap();
+    chain.bridge2_cid().send("deposit", to_transfer, &eth_client).await.unwrap();
+    let bridge_bal: U256 =
+        chain.usdc_cid().call("balanceOf", chain.bridge2_cid().address(chain.eth_chain()), &eth_client).await.unwrap();
+    assert_eq!(bridge_bal, U256::from(30 * usd));
+    let user_bal: U256 = chain.usdc_cid().call("balanceOf", hot_user.to_address(), &eth_client).await.unwrap();
+    assert_eq!(user_bal, U256::zero());
+
+    // Set dispute period and block duration so that we can test that dispute period works.
+    // The bridge must be locked to set the dispute period and block duration, which requires a locker.
+    let locker = hot_user.raw();
+    let is_locker = true;
+    let nonce = U256::from(2);
+    let hash = utils::keccak(("modifyLocker".to_string(), locker, is_locker, nonce));
+    let signature = bridge2_sign_phantom_agent(chain, hash, &hot_wallet);
+    chain
+        .bridge2_cid()
+        .send(
+            "modifyLocker",
+            (
+                locker,
+                is_locker,
+                nonce,
+                SolValidatorSet::from_hot_validator_set(cur_epoch, &active_validator_set),
+                vec![signature],
+            ),
+            &eth_client,
+        )
+        .await
+        .unwrap();
+
+    chain.bridge2_cid().send("emergencyLock", (), &eth_client).await.unwrap();
+
+    let sol_active_cold_validator_set = SolValidatorSet::from_cold_validator_set(cur_epoch, &active_validator_set);
+    perform_bridge_2_validator_action(
+        "changeDisputePeriodSeconds",
+        U256::from(1),
+        nonce,
+        chain,
+        &cold_wallet,
+        &sol_active_cold_validator_set,
+        &eth_client,
+    )
+    .await;
+    perform_bridge_2_validator_action(
+        "changeBlockDurationMillis",
+        U256::from(1000),
+        nonce,
+        chain,
+        &cold_wallet,
+        &sol_active_cold_validator_set,
+        &eth_client,
+    )
+    .await;
+
+    let cur_epoch = cur_epoch + 1;
+    let sol_new_validator_set = SolValidatorSetUpdate::from_validator_set(cur_epoch, &active_validator_set);
+    let hash = utils::keccak((
+        "unlock".to_string(),
+        sol_new_validator_set.epoch,
+        sol_new_validator_set.clone().hot_addresses,
+        sol_new_validator_set.clone().cold_addresses,
+        sol_new_validator_set.clone().powers,
+        nonce,
+    ));
+    let signature = bridge2_sign_phantom_agent(chain, hash, &cold_wallet);
+    chain
+        .bridge2_cid()
+        .send(
+            "emergencyUnlock",
+            (sol_new_validator_set, sol_active_cold_validator_set, vec![signature], nonce),
+            &eth_client,
+        )
+        .await
+        .unwrap();
+
+    // Request withdrawal should work and produce receipt
+    let nonce = 11;
+    let hash = withdrawal_hash(hot_user, usd, nonce);
+    let signatures = vec![bridge2_sign_phantom_agent(chain, hash, &hot_wallet)];
+    let withdrawal_voucher =
+        WithdrawalVoucher2 { usd, nonce, active_validator_set: active_validator_set.clone(), signatures };
+    let tx_receipt = tu::bridge2_withdrawal(&chain, &eth_client, withdrawal_voucher, cur_epoch).await.unwrap();
+    let requested_withdrawals: Vec<RequestedWithdrawalEvent> = eth_client.parse_events(chain.bridge2_cid(), tx_receipt);
+    assert_eq!(requested_withdrawals.len(), 1);
+    let bridge_bal: U256 =
+        chain.usdc_cid().call("balanceOf", chain.bridge2_cid().address(chain.eth_chain()), &eth_client).await.unwrap();
+    assert_eq!(bridge_bal, U256::from(30 * usd));
+    let user_bal: U256 = chain.usdc_cid().call("balanceOf", hot_user.to_address(), &eth_client).await.unwrap();
+    assert_eq!(user_bal, U256::zero());
+
+    // Finalizing withdrawal should fail due to dispute period
+    let message = requested_withdrawals.first().unwrap().message;
+    let result = chain.bridge2_cid().send("batchedFinalizeWithdrawals", vec![message], &eth_client).await;
+    tu::assert_err(result, "Still in dispute period");
+    let bridge_bal: U256 =
+        chain.usdc_cid().call("balanceOf", chain.bridge2_cid().address(chain.eth_chain()), &eth_client).await.unwrap();
+    assert_eq!(bridge_bal, U256::from(30 * usd));
+    let user_bal: U256 = chain.usdc_cid().call("balanceOf", hot_user.to_address(), &eth_client).await.unwrap();
+    assert_eq!(user_bal, U256::zero());
+
+    // Sleep for longer than dispute period and try again should succeed
+    lu::async_sleep(Duration(1.)).await;
+    let tx_receipt = chain.bridge2_cid().send("batchedFinalizeWithdrawals", vec![message], &eth_client).await.unwrap();
+    let withdrawal_finalization_events: Vec<FinalizedWithdrawalEvent> =
+        eth_client.parse_events(chain.bridge2_cid(), tx_receipt);
+    assert_eq!(withdrawal_finalization_events.len(), 1);
+    let bridge_bal: U256 =
+        chain.usdc_cid().call("balanceOf", chain.bridge2_cid().address(chain.eth_chain()), &eth_client).await.unwrap();
+    assert_eq!(bridge_bal, U256::from(29 * usd));
+    let user_bal: U256 = chain.usdc_cid().call("balanceOf", hot_user.to_address(), &eth_client).await.unwrap();
+    assert_eq!(user_bal, U256::from(usd));
+
+    // Try to finalize the same receipt should fail
+    let result = chain.bridge2_cid().send("batchedFinalizeWithdrawals", vec![message], &eth_client).await;
+    tu::assert_err(result, "Withdrawal already finalized");
+    let bridge_bal: U256 =
+        chain.usdc_cid().call("balanceOf", chain.bridge2_cid().address(chain.eth_chain()), &eth_client).await.unwrap();
+    assert_eq!(bridge_bal, U256::from(29 * usd));
+    let user_bal: U256 = chain.usdc_cid().call("balanceOf", hot_user.to_address(), &eth_client).await.unwrap();
+    assert_eq!(user_bal, U256::from(usd));
+}
+
 fn initial_validator_set() -> Set<ValidatorProfile> {
     set![ValidatorProfile {
         power: 1,
@@ -916,6 +1069,24 @@ async fn claim_withdrawal_on_bridge(
 ) -> infra::Result<Receipt> {
     let WithdrawalVoucher { signature, action: WithdrawAction { usd, nonce }, .. } = withdrawal_voucher;
     chain.bridge_cid().send("withdraw", (signature, usd, nonce), client).await
+}
+
+async fn perform_bridge_2_validator_action<T: Tokenizable + Debug + Copy>(
+    action: &str,
+    arg: T,
+    nonce: U256,
+    chain: Chain,
+    wallet: &Wallet,
+    sol_validator_set: &SolValidatorSet,
+    eth_client: &EthClient,
+) {
+    let hash = utils::keccak((action.to_string(), arg, nonce));
+    let signature = bridge2_sign_phantom_agent(chain, hash, wallet);
+    chain
+        .bridge2_cid()
+        .send(action, (arg, nonce, sol_validator_set.clone(), vec![signature]), eth_client)
+        .await
+        .unwrap();
 }
 
 lazy_static! {
