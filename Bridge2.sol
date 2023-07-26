@@ -303,7 +303,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     );
   }
 
-  function finalizeWithdrawal(bytes32 message) private nonReentrant whenNotPaused {
+  function finalizeWithdrawal(bytes32 message) private whenNotPaused {
     require(!finalizedWithdrawals[message], "Withdrawal already finalized");
     Withdrawal memory withdrawal = requestedWithdrawals[message];
 
