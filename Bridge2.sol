@@ -71,6 +71,8 @@ import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/draft-ERC20Permit.sol";
+import "@arbitrum/nitro-contracts/src/precompiles/ArbSys.sol";
 import "./Signature.sol";
 
 struct ValidatorSet {
@@ -103,6 +105,7 @@ struct DepositEvent {
 
 struct Withdrawal {
   address user;
+  address destination;
   uint64 usdc;
   uint64 nonce;
   uint64 requestedTime;
@@ -110,8 +113,24 @@ struct Withdrawal {
   bytes32 message;
 }
 
+struct WithdrawalRequest {
+  address user;
+  address destination;
+  uint64 usd;
+  uint64 nonce;
+  Signature[] signatures;
+}
+
+struct DepositWithPermit {
+  address user;
+  uint64 amount;
+  uint64 deadline;
+  Signature signature;
+}
+
 struct RequestedWithdrawalEvent {
   address user;
+  address destination;
   uint64 usdc;
   uint64 nonce;
   bytes32 message;
@@ -120,6 +139,7 @@ struct RequestedWithdrawalEvent {
 
 struct FinalizedWithdrawalEvent {
   address user;
+  address destination;
   uint64 usdc;
   uint64 nonce;
   bytes32 message;
@@ -139,16 +159,20 @@ struct FinalizedValidatorSetUpdateEvent {
 }
 
 contract Bridge2 is Pausable, ReentrancyGuard {
-  using SafeERC20 for ERC20;
-  ERC20 public usdcToken;
+  using SafeERC20 for ERC20Permit;
+  ERC20Permit public usdcToken;
 
   bytes32 public hotValidatorSetHash;
   bytes32 public coldValidatorSetHash;
   PendingValidatorSetUpdate public pendingValidatorSetUpdate;
 
-  mapping(bytes32 => bool) usedMessages;
-  mapping(address => bool) lockers;
-  mapping(address => bool) finalizers;
+  mapping(bytes32 => bool) public usedMessages;
+  mapping(address => bool) public lockers;
+  mapping(address => bool) public lockerVotes;
+  address[] public lockersVotingLock;
+  uint64 public lockerThreshold;
+
+  mapping(address => bool) public finalizers;
   uint64 public epoch;
   uint64 public totalValidatorPower;
   uint64 public disputePeriodSeconds;
@@ -160,9 +184,9 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   // However, no functionality breaks even if addresses are repeated.
   uint64 public nValidators;
 
-  mapping(bytes32 => Withdrawal) requestedWithdrawals;
-  mapping(bytes32 => bool) finalizedWithdrawals;
-  mapping(bytes32 => bool) withdrawalsInvalidated;
+  mapping(bytes32 => Withdrawal) public requestedWithdrawals;
+  mapping(bytes32 => bool) public finalizedWithdrawals;
+  mapping(bytes32 => bool) public withdrawalsInvalidated;
 
   bytes32 immutable domainSeparator;
 
@@ -170,12 +194,14 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   event Deposit(DepositEvent e);
   event RequestedWithdrawal(RequestedWithdrawalEvent e);
   event FinalizedWithdrawal(FinalizedWithdrawalEvent e);
+  event FailedWithdrawal(bytes32 message, uint32 errorCode);
   event RequestedValidatorSetUpdate(RequestedValidatorSetUpdateEvent e);
   event FinalizedValidatorSetUpdate(FinalizedValidatorSetUpdateEvent e);
   event ModifiedLocker(address indexed locker, bool isLocker);
   event ModifiedFinalizer(address indexed finalizer, bool isFinalizer);
   event ChangedDisputePeriodSeconds(uint64 newDisputePeriodSeconds);
   event ChangedBlockDurationMillis(uint64 newBlockDurationMillis);
+  event ChangedLockerThreshold(uint64 newLockerThreshold);
   event InvalidatedWithdrawals(bytes32[] withdrawalsInvalidated);
 
   // We could have the deployer initialize separately so that all function args in this file can be calldata.
@@ -186,7 +212,8 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     uint64[] memory powers,
     address usdcAddress,
     uint64 _disputePeriodSeconds,
-    uint64 _blockDurationMillis
+    uint64 _blockDurationMillis,
+    uint64 _lockerThreshold
   ) {
     domainSeparator = makeDomainSeparator();
     totalValidatorPower = checkNewValidatorPowers(powers);
@@ -207,9 +234,10 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     bytes32 newColdValidatorSetHash = makeValidatorSetHash(coldValidatorSet);
     coldValidatorSetHash = newColdValidatorSetHash;
 
-    usdcToken = ERC20(usdcAddress);
+    usdcToken = ERC20Permit(usdcAddress);
     disputePeriodSeconds = _disputePeriodSeconds;
     blockDurationMillis = _blockDurationMillis;
+    lockerThreshold = _lockerThreshold;
     addLockersAndFinalizers(hotAddresses);
 
     emit RequestedValidatorSetUpdate(
@@ -263,86 +291,115 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     return checkpoint;
   }
 
-  // An external function anyone can call to deposit usdc into the brigde.
-  // A deposit event will be emitted crediting the L1 with the usdc.
-  function deposit(uint64 usdc) external whenNotPaused nonReentrant {
-    address user = msg.sender;
-    usdcToken.safeTransferFrom(user, address(this), usdc);
-    emit Deposit(DepositEvent({ user: user, usdc: usdc }));
-  }
-
   // An external function anyone can call to withdraw usdc from the bridge by providing valid signatures
   // from the active L1 validators.
   function requestWithdrawal(
+    address user,
+    address destination,
     uint64 usdc,
     uint64 nonce,
     ValidatorSet calldata hotValidatorSet,
-    Signature[] calldata signatures
-  ) external nonReentrant whenNotPaused {
+    Signature[] memory signatures
+  ) internal whenNotPaused returns (uint32, bytes32) {
     // NOTE: this is a temporary workaround because EIP-191 signatures do not match between rust client and solidity.
     // For now we do not care about the overhead with EIP-712 because Arbitrum gas is cheap.
-
-    bytes32 data = keccak256(abi.encode("requestWithdrawal", msg.sender, usdc, nonce));
+    bytes32 data = keccak256(abi.encode("requestWithdrawal", user, destination, usdc, nonce));
     bytes32 message = makeMessage(data);
     checkValidWithdrawal(message);
-
     Withdrawal memory withdrawal = Withdrawal({
-      user: msg.sender,
+      user: user,
+      destination: destination,
       usdc: usdc,
       nonce: nonce,
       requestedTime: uint64(block.timestamp),
       requestedBlockNumber: uint64(block.number),
       message: message
     });
-
-    require(requestedWithdrawals[message].requestedTime == 0, "Withdrawal already requested");
+    if (requestedWithdrawals[message].requestedTime != 0) {
+      return (0, message);
+    }
     checkValidatorSignatures(message, hotValidatorSet, signatures, hotValidatorSetHash);
-
     requestedWithdrawals[message] = withdrawal;
     emit RequestedWithdrawal(
       RequestedWithdrawalEvent({
         user: withdrawal.user,
+        destination: withdrawal.destination,
         usdc: withdrawal.usdc,
         nonce: withdrawal.nonce,
         requestedTime: withdrawal.requestedTime,
         message: withdrawal.message
       })
     );
+    return (type(uint32).max, 0);
   }
 
-  function finalizeWithdrawal(bytes32 message) private whenNotPaused {
+  function batchedRequestWithdrawals(
+    WithdrawalRequest[] memory withdrawalRequests,
+    ValidatorSet calldata hotValidatorSet
+  ) external nonReentrant whenNotPaused {
+    uint64 end = uint64(withdrawalRequests.length);
+    for (uint64 idx; idx < end; idx++) {
+      WithdrawalRequest memory withdrawalRequest = withdrawalRequests[idx];
+      (uint32 errorCode, bytes32 message) = requestWithdrawal(
+        withdrawalRequest.user,
+        withdrawalRequest.destination,
+        withdrawalRequest.usd,
+        withdrawalRequest.nonce,
+        hotValidatorSet,
+        withdrawalRequest.signatures
+      );
+      if (errorCode != type(uint32).max) {
+        emit FailedWithdrawal(message, errorCode);
+      }
+    }
+  }
+
+  function finalizeWithdrawal(bytes32 message) internal returns (uint32) {
     checkValidWithdrawal(message);
 
-    require(!finalizedWithdrawals[message], "Withdrawal already finalized");
+    if (finalizedWithdrawals[message]) {
+      return 1;
+    }
 
     Withdrawal memory withdrawal = requestedWithdrawals[message];
-    require(
-      withdrawal.user != address(0),
-      "Withdrawal message does not correspond to an existing withdrawal request"
+    if (withdrawal.user == address(0)) {
+      return 2;
+    }
+
+    uint32 errorCode = checkDisputePeriod(
+      withdrawal.requestedTime,
+      withdrawal.requestedBlockNumber
     );
 
-    checkDisputePeriod(withdrawal.requestedTime, withdrawal.requestedBlockNumber);
+    if (errorCode != type(uint32).max) {
+      return errorCode;
+    }
 
     finalizedWithdrawals[message] = true;
-    usdcToken.safeTransfer(withdrawal.user, withdrawal.usdc);
+    usdcToken.safeTransfer(withdrawal.destination, withdrawal.usdc);
     emit FinalizedWithdrawal(
       FinalizedWithdrawalEvent({
         user: withdrawal.user,
+        destination: withdrawal.destination,
         usdc: withdrawal.usdc,
         nonce: withdrawal.nonce,
         message: withdrawal.message
       })
     );
+
+    return type(uint32).max;
   }
 
   function batchedFinalizeWithdrawals(
     bytes32[] calldata messages
   ) external nonReentrant whenNotPaused {
     checkFinalizer(msg.sender);
-
     uint64 end = uint64(messages.length);
     for (uint64 idx; idx < end; idx++) {
-      finalizeWithdrawal(messages[idx]);
+      uint32 errorCode = finalizeWithdrawal(messages[idx]);
+      if (errorCode != type(uint32).max) {
+        emit FailedWithdrawal(messages[idx], errorCode);
+      }
     }
   }
 
@@ -350,12 +407,26 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     require(!withdrawalsInvalidated[message], "Withdrawal has been invalidated.");
   }
 
-  function checkDisputePeriod(uint64 time, uint64 blockNumber) private view {
-    require(
-      block.timestamp > time + disputePeriodSeconds &&
-        (uint64(block.number) - blockNumber) * blockDurationMillis > 1000 * disputePeriodSeconds,
-      "Still in dispute period"
-    );
+  function checkDisputePeriod(uint64 time, uint64 blockNumber) private view returns (uint32) {
+    bool enoughTimePassed = block.timestamp > time + disputePeriodSeconds;
+    if (!enoughTimePassed) {
+      return 3;
+    }
+
+    uint64 curBlockNumber;
+    if (block.chainid == 1337) {
+      curBlockNumber = uint64(block.number);
+    } else {
+      curBlockNumber = uint64(ArbSys(address(100)).arbBlockNumber());
+    }
+
+    bool enoughBlocksPassed = (curBlockNumber - blockNumber) * blockDurationMillis >
+      1000 * disputePeriodSeconds;
+    if (!enoughBlocksPassed) {
+      return 4;
+    }
+
+    return type(uint32).max;
   }
 
   // Utility function that verifies the signatures supplied and checks that the validators have reached quorum.
@@ -372,7 +443,6 @@ contract Bridge2 is Pausable, ReentrancyGuard {
 
     uint64 nSignatures = uint64(signatures.length);
     require(nSignatures > 0, "Signers empty");
-
     uint64 cumulativePower;
     uint64 signatureIdx;
     uint64 end = uint64(activeValidatorSet.validators.length);
@@ -383,7 +453,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
         uint64 power = activeValidatorSet.powers[activeValidatorSetIdx];
         cumulativePower += power;
 
-        if (3 * cumulativePower >= 2 * totalValidatorPower) {
+        if (3 * cumulativePower > 2 * totalValidatorPower) {
           break;
         }
 
@@ -395,7 +465,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     }
 
     require(
-      3 * cumulativePower >= 2 * totalValidatorPower,
+      3 * cumulativePower > 2 * totalValidatorPower,
       "Submitted validator set signatures do not have enough power"
     );
   }
@@ -509,10 +579,11 @@ contract Bridge2 is Pausable, ReentrancyGuard {
       "Pending validator set update already finalized"
     );
 
-    checkDisputePeriod(
+    uint32 errorCode = checkDisputePeriod(
       pendingValidatorSetUpdate.updateTime,
       pendingValidatorSetUpdate.updateBlockNumber
     );
+    require(errorCode == type(uint32).max, "Still in dispute period");
 
     finalizeValidatorSetUpdateInner();
   }
@@ -558,12 +629,11 @@ contract Bridge2 is Pausable, ReentrancyGuard {
 
     checkMessageNotUsed(message);
     checkValidatorSignatures(message, activeValidatorSet, signatures, validatorSetHash);
+    if (lockers[locker] && !_isLocker && !paused()) {
+      removeLockerVote(locker);
+    }
     lockers[locker] = _isLocker;
     emit ModifiedLocker(locker, _isLocker);
-  }
-
-  function isLocker(address locker) external view returns (bool) {
-    return lockers[locker];
   }
 
   function modifyFinalizer(
@@ -589,10 +659,6 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     emit ModifiedFinalizer(finalizer, _isFinalizer);
   }
 
-  function isFinalizer(address finalizer) external view returns (bool) {
-    return finalizers[finalizer];
-  }
-
   function checkFinalizer(address finalizer) private view {
     require(finalizers[finalizer], "Sender is not a finalizer");
   }
@@ -613,7 +679,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     uint64 nonce,
     ValidatorSet memory activeColdValidatorSet,
     Signature[] memory signatures
-  ) external whenPaused {
+  ) external {
     bytes32 data = keccak256(
       abi.encode("changeDisputePeriodSeconds", newDisputePeriodSeconds, nonce)
     );
@@ -630,7 +696,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     uint64 nonce,
     ValidatorSet memory activeColdValidatorSet,
     Signature[] memory signatures
-  ) external whenPaused {
+  ) external {
     bytes32 data = keccak256(abi.encode("invalidateWithdrawals", messages, nonce));
     bytes32 message = makeMessage(data);
 
@@ -650,7 +716,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     uint64 nonce,
     ValidatorSet memory activeColdValidatorSet,
     Signature[] memory signatures
-  ) external whenPaused {
+  ) external {
     bytes32 data = keccak256(
       abi.encode("changeBlockDurationMillis", newBlockDurationMillis, nonce)
     );
@@ -663,9 +729,54 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     emit ChangedBlockDurationMillis(newBlockDurationMillis);
   }
 
-  function emergencyLock() external {
+  function changeLockerThreshold(
+    uint64 newLockerThreshold,
+    uint64 nonce,
+    ValidatorSet memory activeColdValidatorSet,
+    Signature[] memory signatures
+  ) external {
+    bytes32 data = keccak256(abi.encode("changeLockerThreshold", newLockerThreshold, nonce));
+    bytes32 message = makeMessage(data);
+
+    checkMessageNotUsed(message);
+    checkValidatorSignatures(message, activeColdValidatorSet, signatures, coldValidatorSetHash);
+
+    lockerThreshold = newLockerThreshold;
+    if (uint64(lockersVotingLock.length) >= lockerThreshold && !paused()) {
+      _pause();
+    }
+    emit ChangedLockerThreshold(newLockerThreshold);
+  }
+
+  function voteEmergencyLock() external {
     require(lockers[msg.sender], "Sender is not authorized to lock smart contract");
-    _pause();
+    bool currentVote = lockerVotes[msg.sender];
+    require(!currentVote, "Locker already voted for emergency lock");
+    lockerVotes[msg.sender] = true;
+    lockersVotingLock.push(msg.sender);
+    if (uint64(lockersVotingLock.length) >= lockerThreshold && !paused()) {
+      _pause();
+    }
+  }
+
+  function unvoteEmergencyLock() external whenNotPaused {
+    require(lockers[msg.sender], "Sender is not authorized to lock smart contract");
+    bool currentVote = lockerVotes[msg.sender];
+    require(currentVote, "Locker is not currently voting for emergency lock");
+    removeLockerVote(msg.sender);
+  }
+
+  function removeLockerVote(address locker) private whenNotPaused {
+    require(lockers[locker], "Sender is not authorized to lock smart contract");
+    lockerVotes[locker] = false;
+    uint64 length = uint64(lockersVotingLock.length);
+    for (uint64 i = 0; i < length; i++) {
+      if (lockersVotingLock[i] == msg.sender) {
+        lockersVotingLock[i] = lockersVotingLock[length - 1];
+        lockersVotingLock.pop();
+        break;
+      }
+    }
   }
 
   function emergencyUnlock(
@@ -673,7 +784,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     ValidatorSet calldata activeColdValidatorSet,
     Signature[] calldata signatures,
     uint64 nonce
-  ) external {
+  ) external whenPaused {
     bytes32 data = keccak256(
       abi.encode(
         "unlock",
@@ -689,6 +800,44 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     checkMessageNotUsed(message);
     updateValidatorSetInner(newValidatorSet, activeColdValidatorSet, signatures, message, true);
     finalizeValidatorSetUpdateInner();
+    uint64 length = uint64(lockersVotingLock.length);
+    for (uint64 i = 0; i < length; i++) {
+      lockerVotes[lockersVotingLock[i]] = false;
+    }
+    delete lockersVotingLock;
     _unpause();
+  }
+
+  function depositWithPermit(
+    address user,
+    uint64 amount,
+    uint64 deadline,
+    Signature memory signature
+  ) private {
+    address spender = address(this);
+    usdcToken.permit(
+      user,
+      spender,
+      amount,
+      deadline,
+      signature.v,
+      bytes32(signature.r),
+      bytes32(signature.s)
+    );
+    usdcToken.safeTransferFrom(user, spender, amount);
+  }
+
+  function batchedDepositWithPermit(
+    DepositWithPermit[] memory deposits
+  ) external nonReentrant whenNotPaused {
+    uint64 end = uint64(deposits.length);
+    for (uint64 idx; idx < end; idx++) {
+      depositWithPermit(
+        deposits[idx].user,
+        deposits[idx].amount,
+        deposits[idx].deadline,
+        deposits[idx].signature
+      );
+    }
   }
 }
