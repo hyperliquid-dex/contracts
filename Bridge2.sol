@@ -98,11 +98,6 @@ struct PendingValidatorSetUpdate {
   bytes32 coldValidatorSetHash;
 }
 
-struct DepositEvent {
-  address user;
-  uint64 usdc;
-}
-
 struct Withdrawal {
   address user;
   address destination;
@@ -126,36 +121,6 @@ struct DepositWithPermit {
   uint64 amount;
   uint64 deadline;
   Signature signature;
-}
-
-struct RequestedWithdrawalEvent {
-  address user;
-  address destination;
-  uint64 usdc;
-  uint64 nonce;
-  bytes32 message;
-  uint64 requestedTime;
-}
-
-struct FinalizedWithdrawalEvent {
-  address user;
-  address destination;
-  uint64 usdc;
-  uint64 nonce;
-  bytes32 message;
-}
-
-struct RequestedValidatorSetUpdateEvent {
-  uint64 epoch;
-  bytes32 hotValidatorSetHash;
-  bytes32 coldValidatorSetHash;
-  uint64 updateTime;
-}
-
-struct FinalizedValidatorSetUpdateEvent {
-  uint64 epoch;
-  bytes32 hotValidatorSetHash;
-  bytes32 coldValidatorSetHash;
 }
 
 contract Bridge2 is Pausable, ReentrancyGuard {
@@ -191,18 +156,46 @@ contract Bridge2 is Pausable, ReentrancyGuard {
   bytes32 immutable domainSeparator;
 
   // These events wrap structs because of a quirk of rust client code which parses them.
-  event Deposit(DepositEvent e);
-  event RequestedWithdrawal(RequestedWithdrawalEvent e);
-  event FinalizedWithdrawal(FinalizedWithdrawalEvent e);
+  event Deposit(address indexed user, uint64 usdc);
+
+  event RequestedWithdrawal(
+    address indexed user,
+    address destination,
+    uint64 usdc,
+    uint64 nonce,
+    bytes32 message,
+    uint64 requestedTime
+  );
+
+  event FinalizedWithdrawal(
+    address indexed user,
+    address destination,
+    uint64 usdc,
+    uint64 nonce,
+    bytes32 message
+  );
+
+  event RequestedValidatorSetUpdate(
+    uint64 epoch,
+    bytes32 hotValidatorSetHash,
+    bytes32 coldValidatorSetHash,
+    uint64 updateTime
+  );
+
+  event FinalizedValidatorSetUpdate(
+    uint64 epoch,
+    bytes32 hotValidatorSetHash,
+    bytes32 coldValidatorSetHash
+  );
+
   event FailedWithdrawal(bytes32 message, uint32 errorCode);
-  event RequestedValidatorSetUpdate(RequestedValidatorSetUpdateEvent e);
-  event FinalizedValidatorSetUpdate(FinalizedValidatorSetUpdateEvent e);
   event ModifiedLocker(address indexed locker, bool isLocker);
+  event DepositWithPermitInsufficientAmount(address user, uint64 amount);
   event ModifiedFinalizer(address indexed finalizer, bool isFinalizer);
   event ChangedDisputePeriodSeconds(uint64 newDisputePeriodSeconds);
   event ChangedBlockDurationMillis(uint64 newBlockDurationMillis);
   event ChangedLockerThreshold(uint64 newLockerThreshold);
-  event InvalidatedWithdrawals(bytes32[] withdrawalsInvalidated);
+  event InvalidatedWithdrawal(Withdrawal withdrawal);
 
   // We could have the deployer initialize separately so that all function args in this file can be calldata.
   // However, calldata does not seem cheaper than memory on Arbitrum, so not a big deal for now.
@@ -241,31 +234,23 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     addLockersAndFinalizers(hotAddresses);
 
     emit RequestedValidatorSetUpdate(
-      RequestedValidatorSetUpdateEvent({
-        epoch: 0,
-        hotValidatorSetHash: hotValidatorSetHash,
-        coldValidatorSetHash: coldValidatorSetHash,
-        updateTime: uint64(block.timestamp)
-      })
+      0,
+      hotValidatorSetHash,
+      coldValidatorSetHash,
+      uint64(block.timestamp)
     );
 
     pendingValidatorSetUpdate = PendingValidatorSetUpdate({
       epoch: 0,
       totalValidatorPower: totalValidatorPower,
       updateTime: 0,
-      updateBlockNumber: uint64(block.number),
+      updateBlockNumber: getCurBlockNumber(),
       hotValidatorSetHash: hotValidatorSetHash,
       coldValidatorSetHash: coldValidatorSetHash,
       nValidators: nValidators
     });
 
-    emit FinalizedValidatorSetUpdate(
-      FinalizedValidatorSetUpdateEvent({
-        epoch: 0,
-        hotValidatorSetHash: hotValidatorSetHash,
-        coldValidatorSetHash: coldValidatorSetHash
-      })
-    );
+    emit FinalizedValidatorSetUpdate(0, hotValidatorSetHash, coldValidatorSetHash);
   }
 
   function addLockersAndFinalizers(address[] memory addresses) private {
@@ -312,7 +297,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
       usdc: usdc,
       nonce: nonce,
       requestedTime: uint64(block.timestamp),
-      requestedBlockNumber: uint64(block.number),
+      requestedBlockNumber: getCurBlockNumber(),
       message: message
     });
     if (requestedWithdrawals[message].requestedTime != 0) {
@@ -321,14 +306,12 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     checkValidatorSignatures(message, hotValidatorSet, signatures, hotValidatorSetHash);
     requestedWithdrawals[message] = withdrawal;
     emit RequestedWithdrawal(
-      RequestedWithdrawalEvent({
-        user: withdrawal.user,
-        destination: withdrawal.destination,
-        usdc: withdrawal.usdc,
-        nonce: withdrawal.nonce,
-        requestedTime: withdrawal.requestedTime,
-        message: withdrawal.message
-      })
+      withdrawal.user,
+      withdrawal.destination,
+      withdrawal.usdc,
+      withdrawal.nonce,
+      withdrawal.message,
+      withdrawal.requestedTime
     );
     return (type(uint32).max, 0);
   }
@@ -378,15 +361,12 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     finalizedWithdrawals[message] = true;
     usdcToken.safeTransfer(withdrawal.destination, withdrawal.usdc);
     emit FinalizedWithdrawal(
-      FinalizedWithdrawalEvent({
-        user: withdrawal.user,
-        destination: withdrawal.destination,
-        usdc: withdrawal.usdc,
-        nonce: withdrawal.nonce,
-        message: withdrawal.message
-      })
+      withdrawal.user,
+      withdrawal.destination,
+      withdrawal.usdc,
+      withdrawal.nonce,
+      withdrawal.message
     );
-
     return type(uint32).max;
   }
 
@@ -407,18 +387,21 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     require(!withdrawalsInvalidated[message], "Withdrawal has been invalidated.");
   }
 
+  function getCurBlockNumber() private view returns (uint64) {
+    if (block.chainid == 1337) {
+      return uint64(block.number);
+    } else {
+      return uint64(ArbSys(address(100)).arbBlockNumber());
+    }
+  }
+
   function checkDisputePeriod(uint64 time, uint64 blockNumber) private view returns (uint32) {
     bool enoughTimePassed = block.timestamp > time + disputePeriodSeconds;
     if (!enoughTimePassed) {
       return 3;
     }
 
-    uint64 curBlockNumber;
-    if (block.chainid == 1337) {
-      curBlockNumber = uint64(block.number);
-    } else {
-      curBlockNumber = uint64(ArbSys(address(100)).arbBlockNumber());
-    }
+    uint64 curBlockNumber = getCurBlockNumber();
 
     bool enoughBlocksPassed = (curBlockNumber - blockNumber) * blockDurationMillis >
       1000 * disputePeriodSeconds;
@@ -555,19 +538,17 @@ contract Bridge2 is Pausable, ReentrancyGuard {
       epoch: newValidatorSet.epoch,
       totalValidatorPower: newTotalValidatorPower,
       updateTime: updateTime,
-      updateBlockNumber: uint64(block.number),
+      updateBlockNumber: getCurBlockNumber(),
       hotValidatorSetHash: newHotValidatorSetHash,
       coldValidatorSetHash: newColdValidatorSetHash,
       nValidators: uint64(newHotValidatorSet.validators.length)
     });
 
     emit RequestedValidatorSetUpdate(
-      RequestedValidatorSetUpdateEvent({
-        epoch: newValidatorSet.epoch,
-        hotValidatorSetHash: newHotValidatorSetHash,
-        coldValidatorSetHash: newColdValidatorSetHash,
-        updateTime: updateTime
-      })
+      newValidatorSet.epoch,
+      newHotValidatorSetHash,
+      newColdValidatorSetHash,
+      updateTime
     );
   }
 
@@ -597,11 +578,9 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     pendingValidatorSetUpdate.updateTime = 0;
 
     emit FinalizedValidatorSetUpdate(
-      FinalizedValidatorSetUpdateEvent({
-        epoch: epoch,
-        hotValidatorSetHash: pendingValidatorSetUpdate.hotValidatorSetHash,
-        coldValidatorSetHash: pendingValidatorSetUpdate.coldValidatorSetHash
-      })
+      epoch,
+      pendingValidatorSetUpdate.hotValidatorSetHash,
+      pendingValidatorSetUpdate.coldValidatorSetHash
     );
   }
 
@@ -706,9 +685,8 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     uint64 end = uint64(messages.length);
     for (uint64 idx; idx < end; idx++) {
       withdrawalsInvalidated[messages[idx]] = true;
+      emit InvalidatedWithdrawal(requestedWithdrawals[messages[idx]]);
     }
-
-    emit InvalidatedWithdrawals(messages);
   }
 
   function changeBlockDurationMillis(
@@ -814,6 +792,12 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     uint64 deadline,
     Signature memory signature
   ) private {
+    uint256 userBalance = usdcToken.balanceOf(user);
+    if (userBalance < uint256(amount)) {
+      emit DepositWithPermitInsufficientAmount(user, amount);
+      return;
+    }
+
     address spender = address(this);
     usdcToken.permit(
       user,
