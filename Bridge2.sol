@@ -281,7 +281,7 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     uint64 nonce,
     ValidatorSet calldata hotValidatorSet,
     Signature[] memory signatures
-  ) internal whenNotPaused {
+  ) internal {
     // NOTE: this is a temporary workaround because EIP-191 signatures do not match between rust client and solidity.
     // For now we do not care about the overhead with EIP-712 because Arbitrum gas is cheap.
     bytes32 data = keccak256(abi.encode("requestWithdrawal", user, destination, usd, nonce));
@@ -801,12 +801,6 @@ contract Bridge2 is Pausable, ReentrancyGuard {
     uint64 deadline,
     Signature memory signature
   ) private {
-    uint256 userBalance = usdcToken.balanceOf(user);
-    if (userBalance < uint256(usd)) {
-      emit FailedPermitDeposit(user, usd, 0);
-      return;
-    }
-
     address spender = address(this);
     try
       usdcToken.permit(
@@ -819,10 +813,17 @@ contract Bridge2 is Pausable, ReentrancyGuard {
         bytes32(signature.s)
       )
     {} catch {
-      emit FailedPermitDeposit(user, usd, 1);
+      emit FailedPermitDeposit(user, usd, 0);
       return;
     }
-    usdcToken.safeTransferFrom(user, spender, usd);
+
+    try usdcToken.transferFrom(user, spender, usd) returns (bool success) {
+      if (!success) {
+        emit FailedPermitDeposit(user, usd, 1);
+      }
+    } catch {
+      emit FailedPermitDeposit(user, usd, 1);
+    }
   }
 
   function batchedDepositWithPermit(
